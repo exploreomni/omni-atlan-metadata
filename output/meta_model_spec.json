@@ -1,0 +1,189 @@
+{
+  "specification_version": "1.0",
+  "created_at": "2025-11-14T18:21:48.825625",
+  "source": "Omni Integration",
+  "meta_model_extension": {
+    "asset_types": [
+      {
+        "type_name": "OmniDataWarehouseSchema",
+        "display_name": "Omni Data Warehouse Schema",
+        "description": "Data warehouse schema from Omni connection",
+        "parent_type": "Connection"
+      },
+      {
+        "type_name": "OmniSchemaModel",
+        "display_name": "Omni Schema Model",
+        "description": "Schema model defined in YAML files",
+        "parent_type": "Asset"
+      },
+      {
+        "type_name": "OmniTopic",
+        "display_name": "Omni Topic",
+        "description": "Virtual data mart or data domain - use case specific subset of tables and joins",
+        "parent_type": "DataDomain"
+      },
+      {
+        "type_name": "OmniSharedModel",
+        "display_name": "Omni Shared Model",
+        "description": "Shared model used across workbooks",
+        "parent_type": "Asset"
+      },
+      {
+        "type_name": "OmniWorkbookModel",
+        "display_name": "Omni Workbook Model",
+        "description": "Model specific to a workbook",
+        "parent_type": "Asset"
+      },
+      {
+        "type_name": "OmniWorkbookTab",
+        "display_name": "Omni Workbook Tab",
+        "description": "Tab within a workbook",
+        "parent_type": "Asset"
+      },
+      {
+        "type_name": "OmniDashboardTile",
+        "display_name": "Omni Dashboard Tile",
+        "description": "Tile within a dashboard",
+        "parent_type": "Asset"
+      },
+      {
+        "type_name": "OmniDashboard",
+        "display_name": "Omni Dashboard",
+        "description": "Dashboard in Omni",
+        "parent_type": "Asset"
+      },
+      {
+        "type_name": "OmniWorkbook",
+        "display_name": "Omni Workbook",
+        "description": "Saved workbook in Omni",
+        "parent_type": "Asset"
+      }
+    ],
+    "relationship_types": [
+      {
+        "type_name": "OmniSchemaModelToDataWarehouse",
+        "display_name": "Schema Model to Data Warehouse",
+        "description": "Links schema model to underlying data warehouse schema"
+      },
+      {
+        "type_name": "OmniTopicToSchemaModel",
+        "display_name": "Topic to Schema Model",
+        "description": "Links topic to its schema model"
+      },
+      {
+        "type_name": "OmniSharedModelToTopic",
+        "display_name": "Shared Model to Topic",
+        "description": "Links shared model to topic"
+      },
+      {
+        "type_name": "OmniWorkbookModelToSharedModel",
+        "display_name": "Workbook Model to Shared Model",
+        "description": "Links workbook model to shared model"
+      },
+      {
+        "type_name": "OmniWorkbookTabToWorkbookModel",
+        "display_name": "Workbook Tab to Workbook Model",
+        "description": "Links workbook tab to workbook model"
+      },
+      {
+        "type_name": "OmniDashboardTileToWorkbookTab",
+        "display_name": "Dashboard Tile to Workbook Tab",
+        "description": "Links dashboard tile to workbook tab"
+      },
+      {
+        "type_name": "OmniDashboardToDashboardTile",
+        "display_name": "Dashboard to Dashboard Tile",
+        "description": "Links dashboard to its tiles"
+      },
+      {
+        "type_name": "OmniDocumentToWorkbookModel",
+        "display_name": "Document to Workbook Model",
+        "description": "Links document (dashboard/workbook) to its workbook model"
+      },
+      {
+        "type_name": "OmniQueryToDocument",
+        "display_name": "Query to Document",
+        "description": "Links query to its document (dashboard/workbook)"
+      },
+      {
+        "type_name": "OmniDocumentToConnection",
+        "display_name": "Document to Connection",
+        "description": "Links document (dashboard/workbook) to its connection"
+      },
+      {
+        "type_name": "OmniSharedModelToConnection",
+        "display_name": "Shared Model to Connection",
+        "description": "Links shared model to its connection"
+      },
+      {
+        "type_name": "OmniWorkbookModelToConnection",
+        "display_name": "Workbook Model to Connection",
+        "description": "Links workbook model to its connection"
+      }
+    ],
+    "custom_attributes": {
+      "omni_schema_id": {
+        "type": "string",
+        "description": "Omni schema ID"
+      },
+      "omni_topic_id": {
+        "type": "string",
+        "description": "Omni topic ID"
+      },
+      "omni_shared_model_id": {
+        "type": "string",
+        "description": "Omni shared model ID"
+      },
+      "omni_workbook_model_id": {
+        "type": "string",
+        "description": "Omni workbook model ID"
+      },
+      "omni_workbook_tab_id": {
+        "type": "string",
+        "description": "Omni workbook tab ID"
+      },
+      "omni_dashboard_tile_id": {
+        "type": "string",
+        "description": "Omni dashboard tile ID"
+      },
+      "omni_dashboard_id": {
+        "type": "string",
+        "description": "Omni dashboard ID"
+      },
+      "omni_branch": {
+        "type": "string",
+        "description": "Branch name (main, branch, etc.)"
+      },
+      "omni_yaml_file_path": {
+        "type": "string",
+        "description": "Path to YAML file"
+      },
+      "omni_metadata_source": {
+        "type": "string",
+        "description": "Source of metadata"
+      },
+      "omni_topic_type": {
+        "type": "string",
+        "description": "Type of topic"
+      },
+      "omni_use_case": {
+        "type": "string",
+        "description": "Use case for the topic"
+      }
+    }
+  },
+  "asset_type_summary": {
+    "data_warehouse_schemas": 0,
+    "schema_models": 0,
+    "topics": 0,
+    "shared_models": 10,
+    "workbook_models": 0,
+    "workbook_tabs": 0,
+    "dashboard_tiles": 0,
+    "dashboards": 14,
+    "workbooks": 0,
+    "queries": 82,
+    "documents": 14,
+    "connections": 7
+  }
+}

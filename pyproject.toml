@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-atlan-integration"
+version = "0.1.0"
+description = "Integration between Omni Analytics and Atlan using Atlan Apps Framework"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "atlan-sdk>=0.0.1",
+    "temporalio>=1.5.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["omni_atlan*"]
+

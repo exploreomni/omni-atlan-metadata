@@ -1,0 +1,176 @@
+{
+  "specification_version": "1.0",
+  "created_at": "2025-11-14T18:21:48.827007",
+  "source": "Omni Integration",
+  "asset_profiles": {
+    "shared_models": {
+      "type_name": "OmniSharedModelMain",
+      "required_attributes": [
+        "name",
+        "qualified_name",
+        "description",
+        "omni_shared_model_id",
+        "omni_connection_id",
+        "omni_branch"
+      ],
+      "optional_attributes": [],
+      "sample_attributes": {
+        "name": "fpl",
+        "qualified_name": "omni://sharedmodel/8c220fe3-60d1-4665-9dcc-06e071c3d0e7/branch/main",
+        "description": "",
+        "omni_shared_model_id": "8c220fe3-60d1-4665-9dcc-06e071c3d0e7",
+        "omni_connection_id": "aa82ca0a-4988-485a-948a-7017641b1f18",
+        "omni_branch": "main"
+      },
+      "relationship_types": [
+        "OmniSharedModelToConnection"
+      ]
+    },
+    "dashboards": {
+      "type_name": "OmniDashboard",
+      "required_attributes": [
+        "name",
+        "qualified_name",
+        "description",
+        "omni_dashboard_id",
+        "omni_connection_id",
+        "omni_folder_id",
+        "omni_folder_name",
+        "omni_owner_id",
+        "omni_owner_name",
+        "omni_scope",
+        "omni_updated_at",
+        "omni_document_id"
+      ],
+      "optional_attributes": [],
+      "sample_attributes": {
+        "name": "Welcome to Omni - Begin Here!",
+        "qualified_name": "omni://dashboard/d28acf77",
+        "description": "",
+        "omni_dashboard_id": "d28acf77",
+        "omni_connection_id": "c967eb8c-2395-44ef-b89f-17bd4a4e8790",
+        "omni_folder_id": "0c60be26-642f-4236-8776-b67e1a1168ec",
+        "omni_folder_name": "Omni Examples",
+        "omni_owner_id": "f4366737-d525-4aed-98f2-6bf35612f816",
+        "omni_owner_name": "Peter Whitehead",
+        "omni_scope": "organization",
+        "omni_updated_at": "2025-09-15T21:55:26.274Z",
+        "omni_document_id": "d28acf77"
+      },
+      "relationship_types": []
+    },
+    "queries": {
+      "type_name": "OmniQuery",
+      "required_attributes": [
+        "name",
+        "qualified_name",
+        "description",
+        "omni_query_id",
+        "omni_document_id",
+        "omni_table",
+        "omni_fields_used",
+        "omni_query_limit",
+        "omni_query_sorts",
+        "omni_query_filters"
+      ],
+      "optional_attributes": [],
+      "sample_attributes": {
+        "name": "Quick Aggregations",
+        "qualified_name": "omni://query/19c4fa3b-6617-441d-ac7d-5d1235012eb2",
+        "description": "",
+        "omni_query_id": "19c4fa3b-6617-441d-ac7d-5d1235012eb2",
+        "omni_document_id": "d28acf77",
+        "omni_table": "ecomm__order_items",
+        "omni_fields_used": [
+          "ecomm__order_items.created_at[date]"
+        ],
+        "omni_query_limit": 1000,
+        "omni_query_sorts": [
+          {
+            "null_sort": "OMNI_DEFAULT",
+            "column_name": "ecomm__order_items.created_at[date]",
+            "is_column_sort": false,
+            "sort_descending": false
+          }
+        ],
+        "omni_query_filters": {
+          "ecomm__order_items.created_at": {
+            "kind": "TIME_FOR_INTERVAL_DURATION",
+            "type": "date",
+            "left_side": "14 days ago",
+            "right_side": "14 days"
+          }
+        }
+      },
+      "relationship_types": [
+        "OmniQueryToDocument"
+      ]
+    },
+    "documents": {
+      "type_name": "OmniDocument",
+      "required_attributes": [
+        "name",
+        "qualified_name",
+        "description",
+        "omni_document_id",
+        "omni_document_type",
+        "omni_connection_id",
+        "omni_folder_id",
+        "omni_folder_name",
+        "omni_owner_id",
+        "omni_owner_name",
+        "omni_scope",
+        "omni_updated_at"
+      ],
+      "optional_attributes": [],
+      "sample_attributes": {
+        "name": "Welcome to Omni - Begin Here!",
+        "qualified_name": "omni://document/d28acf77",
+        "description": "",
+        "omni_document_id": "d28acf77",
+        "omni_document_type": "dashboard",
+        "omni_connection_id": "c967eb8c-2395-44ef-b89f-17bd4a4e8790",
+        "omni_folder_id": "0c60be26-642f-4236-8776-b67e1a1168ec",
+        "omni_folder_name": "Omni Examples",
+        "omni_owner_id": "f4366737-d525-4aed-98f2-6bf35612f816",
+        "omni_owner_name": "Peter Whitehead",
+        "omni_scope": "organization",
+        "omni_updated_at": "2025-09-15T21:55:26.274Z"
+      },
+      "relationship_types": [
+        "OmniDocumentToConnection"
+      ]
+    },
+    "connections": {
+      "type_name": "OmniConnection",
+      "required_attributes": [
+        "name",
+        "qualified_name",
+        "description",
+        "omni_connection_id",
+        "omni_dialect",
+        "omni_database",
+        "omni_default_schema",
+        "omni_deleted_at",
+        "omni_user_attribute_name_for_connection_environments",
+        "omni_branch_connection_environment_overrides_user_attr",
+        "omni_environment_connection_switches_schema_model"
+      ],
+      "optional_attributes": [],
+      "sample_attributes": {
+        "name": "snowflake2",
+        "qualified_name": "omni://connection/82d79d07-fe31-45cb-88e0-8a6580e825f2",
+        "description": "",
+        "omni_connection_id": "82d79d07-fe31-45cb-88e0-8a6580e825f2",
+        "omni_dialect": "snowflake",
+        "omni_database": "NBA",
+        "omni_default_schema": null,
+        "omni_deleted_at": null,
+        "omni_user_attribute_name_for_connection_environments": null,
+        "omni_branch_connection_environment_overrides_user_attr": false,
+        "omni_environment_connection_switches_schema_model": false
+      },
+      "relationship_types": []
+    }
+  }
+}
