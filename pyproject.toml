@@ -1,31 +1,61 @@
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "omni-atlan-integration"
+name = "omni-connector-app"
 version = "0.1.0"
-description = "Integration between Omni Analytics and Atlan using Atlan Apps Framework"
+description = "Atlan custom app for extracting Omni metadata."
+authors = [{ name = "Atlan App Team", email = "connect@atlan.com" }]
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
 readme = "README.md"
-requires-python = ">=3.8"
 dependencies = [
-    "atlan-sdk>=0.0.1",
-    "temporalio>=1.5.0",
-    "requests>=2.31.0",
-    "python-dotenv>=1.0.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
+    "atlan-application-sdk[workflows,tests]==2.3.1",
+    "poethepoet",
+    "pyarrow>=23.0.0",
+    "httpx>=0.28.1",
+    "pyyaml>=6.0.2",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0",
+    "pre-commit>=4.2.0",
+    "pytest",
+    "pytest-asyncio",
+    "coverage",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["omni_atlan*"]
+[tool.poe.tasks]
+start-dapr = "dapr run --enable-api-logging --log-level debug --app-id app --app-port 3000 --scheduler-host-address '' --placement-host-address '' --max-body-size 1024Mi --dapr-http-port 3500 --dapr-grpc-port 50001 --resources-path components"
+start-temporal = "temporal server start-dev --db-filename ./temporal.db"
+start-deps.shell = "poe start-dapr & poe start-temporal &"
+stop-deps.shell = "lsof -ti:3000,3500,7233,50001 | xargs kill -9 2>/dev/null || true"
 
+[tool.poe.tasks.download-components]
+interpreter = "python"
+env = { SDK_VERSION = "v2.3.1" }
+shell = """
+import pathlib, requests, os
+
+components_dir = pathlib.Path("components")
+components_dir.mkdir(exist_ok=True)
+
+api_url = "https://api.github.com/repos/atlanhq/application-sdk/contents/components"
+response = requests.get(api_url, params={"ref": os.getenv("SDK_VERSION")})
+response.raise_for_status()
+
+for file_info in response.json():
+    if file_info["type"] == "file" and file_info["name"].endswith(".yaml"):
+        file_response = requests.get(file_info["download_url"])
+        file_response.raise_for_status()
+        (components_dir / file_info["name"]).write_text(file_response.text)
+        print(f"Downloaded: {file_info['name']}")
+"""
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["./**/*.py"]
+
+[tool.hatch.build.targets.wheel]
+include = ["./**/*.py"]
+packages = ["app"]

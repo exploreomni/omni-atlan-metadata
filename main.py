@@ -1,82 +1,46 @@
-"""Main entry point for the Omni-Atlan integration application"""
+"""Main entrypoint for the Omni connector application."""
 
 import asyncio
-import sys
-from temporalio.client import Client
-from omni_atlan.workflows import SyncOmniMetadataWorkflow, IncrementalSyncWorkflow
-from omni_atlan.config import get_temporal_config
+
+from app.activities import ActivitiesClass
+from app.client import ClientClass
+from app.handler import HandlerClass
+from app.workflow import WorkflowClass
+from application_sdk.application import BaseApplication
+from application_sdk.common.error_codes import ApiError
+from application_sdk.constants import APPLICATION_NAME
+from application_sdk.observability.decorators.observability_decorator import (
+    observability,
+)
+from application_sdk.observability.logger_adaptor import get_logger
+from application_sdk.observability.metrics_adaptor import get_metrics
+from application_sdk.observability.traces_adaptor import get_traces
+
+logger = get_logger(__name__)
+metrics = get_metrics()
+traces = get_traces()
 
 
-async def run_full_sync():
-    """Run a full sync of all metadata from Omni to Atlan"""
-    temporal_config = get_temporal_config()
-    
-    # Connect to Temporal
-    client = await Client.connect(
-        f"{temporal_config.host}",
-        namespace=temporal_config.namespace
-    )
-    
-    # Start workflow
-    handle = await client.start_workflow(
-        SyncOmniMetadataWorkflow.run,
-        "all",
-        id="omni-atlan-sync-full",
-        task_queue="omni-atlan-sync",
-    )
-    
-    print(f"Started workflow: {handle.id}")
-    result = await handle.result()
-    print(f"Workflow completed: {result}")
-    return result
+@observability(logger=logger, metrics=metrics, traces=traces)
+async def main():
+    try:
+        logger.info("Starting Omni connector application")
+        application = BaseApplication(
+            name=APPLICATION_NAME, client_class=ClientClass, handler_class=HandlerClass
+        )
 
+        await application.setup_workflow(
+            workflow_and_activities_classes=[(WorkflowClass, ActivitiesClass)],
+        )
 
-async def run_incremental_sync(last_sync_timestamp: str):
-    """Run an incremental sync from Omni to Atlan"""
-    temporal_config = get_temporal_config()
-    
-    # Connect to Temporal
-    client = await Client.connect(
-        f"{temporal_config.host}",
-        namespace=temporal_config.namespace
-    )
-    
-    # Start workflow
-    handle = await client.start_workflow(
-        IncrementalSyncWorkflow.run,
-        last_sync_timestamp,
-        id="omni-atlan-sync-incremental",
-        task_queue="omni-atlan-sync",
-    )
-    
-    print(f"Started workflow: {handle.id}")
-    result = await handle.result()
-    print(f"Workflow completed: {result}")
-    return result
+        await application.start_worker()
+        await application.setup_server(workflow_class=WorkflowClass, has_configmap=True)
+        await application.start_server()
 
-
-def main():
-    """Main CLI entry point"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python main.py full-sync          # Run full sync")
-        print("  python main.py incremental-sync <timestamp>  # Run incremental sync")
-        sys.exit(1)
-    
-    command = sys.argv[1]
-    
-    if command == "full-sync":
-        asyncio.run(run_full_sync())
-    elif command == "incremental-sync":
-        if len(sys.argv) < 3:
-            print("Error: timestamp required for incremental sync")
-            sys.exit(1)
-        asyncio.run(run_incremental_sync(sys.argv[2]))
-    else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
+    except ApiError:
+        logger.error(f"{ApiError.SERVER_START_ERROR}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())

@@ -1,118 +1,61 @@
-# Omni-Atlan Integration
+# Omni Connector App
 
-This project extracts metadata from Omni and generates output files for the Atlan team to use for:
-- Asset profile design
-- Lineage graph construction
-- Meta model extensions
-- Publishing to Atlan
+Atlan custom app for extracting metadata from Omni APIs and transforming it into Atlan-ready entity payloads.
 
-## Goal
+## What this app does
 
-Generate Omni metadata in a format that the Atlan team can use to design asset profiles, build lineage graphs, extend the meta model, and publish assets to Atlan.
+- Connects to Omni REST APIs using API token authentication.
+- Extracts connections, models, topics (from model YAML), folders, and documents.
+- Transforms extracted metadata into Atlan-ready entity dictionaries.
+- Writes NDJSON output for validation during connector development.
 
-## Documentation Links
+## App structure
 
-### Omni API Documentation
-- [Omni API Overview](https://docs.omni.co/docs/API)
-- [Documents API](https://docs.omni.co/docs/API/documents)
-- [Retrieve Document Queries](https://docs.omni.co/docs/API/documents#retrieve-document-queries)
-- [Connections API](https://docs.omni.co/docs/API/connections#list-connections)
-- [Models API](https://docs.omni.co/docs/API/models)
-- [Topics API](https://docs.omni.co/docs/API/topics)
+This follows Atlan app conventions:
 
-### Atlan Documentation
-- [Atlan Apps Framework](https://docs.atlan.com/product/capabilities/build-apps/concepts/apps-framework)
+- `main.py`
+- `app/activities.py`
+- `app/workflow.py`
+- `app/client.py`
+- `app/handler.py`
+- `app/transformer.py`
+- `app/frontend/workflow.json`
 
-## Setup
-
-1. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Create a `.env` file with your Omni credentials:
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and add:
-```
-OMNI_BASE_URL=https://your-instance.omniapp.co
-OMNI_API_KEY=your_api_key_here
-```
-
-## Usage
-
-Run the metadata extraction script to generate output files for the Atlan team:
+## Local setup
 
 ```bash
-python generate_atlan_output.py
+uv sync --all-extras --all-groups
+uv run poe download-components
 ```
 
-This will generate the following files in the `output/` directory:
-- `omni_metadata_full.json` - Complete metadata with all assets
-- `meta_model_spec.json` - Meta model extension specifications
-- `lineage_spec.json` - Lineage mappings for graph construction
-- `asset_profile_spec.json` - Asset profile specifications
+Start dependencies:
 
-## Extracted Metadata
-
-The integration extracts the following Omni assets:
-
-- **Connections** - Database connections with dialect, database, and schema information
-- **Shared Models** - Base models that can be used across workbooks
-- **Documents** - Dashboards and saved workbooks
-- **Queries** - Queries from documents with fields, tables, sorts, and filters
-- **Topics** - Virtual data marts/domains (when available)
-
-## Lineage
-
-The integration builds lineage relationships tracing:
-- **Connection** → **Shared Model** → **Workbook Model** → **Document** → **Query**
-
-This enables end-to-end data lineage visualization from source connections through models and documents to queries.
-
-## Output Files
-
-### `omni_metadata_full.json`
-Complete metadata for all extracted assets, organized by asset type.
-
-### `meta_model_spec.json`
-Specifications for Atlan meta model extensions, including:
-- Asset types
-- Relationship types
-- Custom attributes
-
-### `lineage_spec.json`
-Lineage mappings showing upstream and downstream relationships between assets.
-
-### `asset_profile_spec.json`
-Asset profile specifications with required and optional attributes for each asset type.
-
-## Project Structure
-
-```
-omni_atlan/
-├── config.py              # Configuration management
-├── omni_client.py         # Omni API client
-├── metadata_extractor.py   # Metadata extraction logic
-├── meta_model_mapper.py   # Mapping to Atlan meta model
-└── output_formatter.py    # Output file formatting
-
-generate_atlan_output.py   # Main script to generate output files
-main.py                     # CLI entry point (for Temporal workflows)
+```bash
+uv run poe start-deps
 ```
 
-## Rate Limiting
+Run app:
 
-The Omni API has a rate limit of 60 requests per minute. The integration includes automatic rate limiting with exponential backoff to handle rate limit errors gracefully.
+```bash
+uv run main.py
+```
 
-## License
+Optional richer local UI:
 
-[Add your license here]
+```bash
+npx @atlanhq/app-playground install-to frontend/static
+```
+
+## Runtime URLs
+
+- App UI: `http://localhost:8000`
+- Temporal UI: `http://localhost:8233`
+
+## Config fields
+
+- `omni_base_url`: Omni base API URL (for example `https://your-org.omniapp.co/api`)
+- `omni_api_token`: PAT or organization API key
+- `tenant_id`: prefix used in generated qualified names
+- `page_size`, `max_pages`: extraction controls
+- `verify_ssl`, `timeout_seconds`: HTTP behavior
+- `save_output_local`, `output_file`: output settings

@@ -1,0 +1,105 @@
+{
+  "id": "omni_connector",
+  "name": "Omni Metadata Connector",
+  "logo": "https://assets.atlan.com/assets/ph-cloud.svg",
+  "config": {
+    "properties": {
+      "omni_base_url": {
+        "type": "string",
+        "required": true,
+        "ui": {
+          "label": "Omni API Base URL",
+          "placeholder": "https://your-org.omniapp.co/api",
+          "grid": 8
+        }
+      },
+      "omni_api_token": {
+        "type": "string",
+        "required": true,
+        "ui": {
+          "label": "Omni API Token",
+          "placeholder": "Paste organization API key or PAT",
+          "grid": 8
+        }
+      },
+      "tenant_id": {
+        "type": "string",
+        "required": true,
+        "ui": {
+          "label": "Tenant ID / Prefix",
+          "placeholder": "omni",
+          "grid": 4
+        }
+      },
+      "page_size": {
+        "type": "integer",
+        "required": true,
+        "ui": {
+          "label": "Page Size",
+          "placeholder": "50",
+          "grid": 4
+        }
+      },
+      "max_pages": {
+        "type": "integer",
+        "required": false,
+        "ui": {
+          "label": "Max Pages (optional)",
+          "placeholder": "2",
+          "grid": 4
+        }
+      },
+      "verify_ssl": {
+        "type": "boolean",
+        "required": false,
+        "ui": {
+          "label": "Verify SSL",
+          "grid": 3
+        }
+      },
+      "timeout_seconds": {
+        "type": "integer",
+        "required": false,
+        "ui": {
+          "label": "HTTP Timeout Seconds",
+          "placeholder": "30",
+          "grid": 3
+        }
+      },
+      "save_output_local": {
+        "type": "boolean",
+        "required": false,
+        "ui": {
+          "label": "Write NDJSON output locally",
+          "grid": 5
+        }
+      },
+      "output_file": {
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "Output File",
+          "placeholder": "omni_entities.ndjson",
+          "grid": 5
+        }
+      }
+    },
+    "steps": [
+      {
+        "id": "payload",
+        "title": "Omni Connection & Extraction",
+        "properties": [
+          "omni_base_url",
+          "omni_api_token",
+          "tenant_id",
+          "page_size",
+          "max_pages",
+          "verify_ssl",
+          "timeout_seconds",
+          "save_output_local",
+          "output_file"
+        ]
+      }
+    ]
+  }
+}
