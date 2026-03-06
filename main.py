@@ -5,6 +5,7 @@ import asyncio
 from app.activities import ActivitiesClass
 from app.client import ClientClass
 from app.handler import HandlerClass
+from app.typedefs import register_typedefs
 from app.workflow import WorkflowClass
 from application_sdk.application import BaseApplication
 from application_sdk.common.error_codes import ApiError
@@ -33,9 +34,19 @@ async def main():
             workflow_and_activities_classes=[(WorkflowClass, ActivitiesClass)],
         )
 
-        await application.start_worker()
-        await application.setup_server(workflow_class=WorkflowClass, has_configmap=True)
-        await application.start_server()
+        try:
+            register_typedefs()
+        except Exception:
+            logger.warning(
+                "Could not register Omni typedefs — Atlan may not be configured. "
+                "Set ATLAN_BASE_URL and ATLAN_API_KEY to enable typedef registration.",
+                exc_info=True,
+            )
+
+        await application.start(
+            workflow_class=WorkflowClass,
+            has_configmap=True,
+        )
 
     except ApiError:
         logger.error(f"{ApiError.SERVER_START_ERROR}", exc_info=True)
