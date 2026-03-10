@@ -1,8 +1,8 @@
 import json
-from abc import ABC
 from pathlib import Path
 from typing import Any, Dict
 
+from application_sdk.handlers import HandlerInterface
 from application_sdk.observability.logger_adaptor import get_logger
 
 from .client import ClientClass
@@ -10,7 +10,7 @@ from .client import ClientClass
 logger = get_logger(__name__)
 
 
-class HandlerClass(ABC):
+class HandlerClass(HandlerInterface):
     def __init__(self, client: ClientClass | None = None):
         self.client = client or ClientClass()
 
@@ -21,18 +21,16 @@ class HandlerClass(ABC):
         self.client.load_credentials(credentials)
 
     async def test_auth(self, *args: Any, **kwargs: Any) -> bool:
-        credentials = kwargs.get("credentials") or {}
-        if args and isinstance(args[0], dict):
-            credentials = args[0]
-        self.client.load_credentials(credentials)
-        _ = self.client.list_connections()
+        # load() has already initialized the client with credentials.
+        self.client.list_connections()
         return True
 
     async def preflight_check(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        credentials = kwargs.get("credentials") or {}
-        metadata = kwargs.get("metadata") or {}
-        await self.load(credentials=credentials)
-        _ = self.client.list_connections()
+        # Server path: args[0] = body.model_dump() = {"credentials": {...}, "metadata": {...}}
+        # Activities path: kwargs = {"credentials": {...}, "metadata": {...}}
+        data = args[0] if args and isinstance(args[0], dict) else {}
+        metadata = kwargs.get("metadata") or data.get("metadata") or {}
+        self.client.list_connections()
         return {
             "success": True,
             "message": "Omni connection validated.",

@@ -13,9 +13,10 @@ class OmniMetadataTransformer:
         workflow_id: str,
         workflow_run_id: str,
     ) -> list[dict[str, Any]]:
+        document_model_ids: set[str] = snapshot.get("document_model_ids", set())
         entities: list[dict[str, Any]] = []
         entities.extend(self._connections(snapshot.get("connections", []), workflow_id, workflow_run_id))
-        entities.extend(self._models(snapshot.get("models", []), workflow_id, workflow_run_id))
+        entities.extend(self._models(snapshot.get("models", []), workflow_id, workflow_run_id, document_model_ids))
         entities.extend(self._topics(snapshot.get("topics", []), workflow_id, workflow_run_id))
         entities.extend(self._folders(snapshot.get("folders", []), workflow_id, workflow_run_id))
         entities.extend(self._documents(snapshot.get("documents", []), workflow_id, workflow_run_id))
@@ -48,8 +49,8 @@ class OmniMetadataTransformer:
                         "omniId": omni_id,
                         "dialect": row.get("dialect"),
                         "database": row.get("database"),
+                        **self._base_custom_attributes(workflow_id, workflow_run_id),
                     },
-                    "customAttributes": self._base_custom_attributes(workflow_id, workflow_run_id),
                 }
             )
         return entities
@@ -59,12 +60,19 @@ class OmniMetadataTransformer:
         records: list[dict[str, Any]],
         workflow_id: str,
         workflow_run_id: str,
+        document_model_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
         for row in records:
             model_id = row.get("id")
             if not model_id:
                 continue
+            if row.get("modelKind") == "SCHEMA":
+                continue
+            # Exclude unnamed WORKBOOK models that aren't backing a document.
+            if row.get("modelKind") == "WORKBOOK" and not row.get("name"):
+                if document_model_ids is None or model_id not in document_model_ids:
+                    continue
             conn_id = row.get("connectionId")
             base_model_id = row.get("baseModelId")
             entities.append(
@@ -76,16 +84,14 @@ class OmniMetadataTransformer:
                         "omniId": model_id,
                         "modelKind": row.get("modelKind"),
                         "updatedAt": row.get("updatedAt"),
-                    },
-                    "relationshipAttributes": {
                         "connectionQualifiedName": (
                             f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
                         ),
                         "baseModelQualifiedName": (
                             f"{self.tenant_id}/model/{base_model_id}" if base_model_id else None
                         ),
+                        **self._base_custom_attributes(workflow_id, workflow_run_id),
                     },
-                    "customAttributes": self._base_custom_attributes(workflow_id, workflow_run_id),
                 }
             )
         return entities
@@ -110,11 +116,9 @@ class OmniMetadataTransformer:
                         "name": row.get("label") or topic_name,
                         "omniName": topic_name,
                         "baseViewName": row.get("baseViewName"),
-                    },
-                    "relationshipAttributes": {
                         "modelQualifiedName": f"{self.tenant_id}/model/{model_id}",
+                        **self._base_custom_attributes(workflow_id, workflow_run_id),
                     },
-                    "customAttributes": self._base_custom_attributes(workflow_id, workflow_run_id),
                 }
             )
         return entities
@@ -142,8 +146,8 @@ class OmniMetadataTransformer:
                         "scope": row.get("scope"),
                         "ownerId": owner.get("id"),
                         "ownerName": owner.get("name"),
+                        **self._base_custom_attributes(workflow_id, workflow_run_id),
                     },
-                    "customAttributes": self._base_custom_attributes(workflow_id, workflow_run_id),
                 }
             )
         return entities
@@ -162,6 +166,8 @@ class OmniMetadataTransformer:
             owner = row.get("owner") or {}
             folder = row.get("folder") or {}
             doc_type = "omni_dashboard" if row.get("hasDashboard") else "omni_workbook"
+            conn_id = row.get("connectionId")
+            folder_id = folder.get("id")
             entities.append(
                 {
                     "typeName": doc_type,
@@ -176,18 +182,14 @@ class OmniMetadataTransformer:
                         "ownerId": owner.get("id"),
                         "ownerName": owner.get("name"),
                         "folderPath": folder.get("path"),
-                    },
-                    "relationshipAttributes": {
                         "connectionQualifiedName": (
-                            f"{self.tenant_id}/connection/{row.get('connectionId')}"
-                            if row.get("connectionId")
-                            else None
+                            f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
                         ),
                         "folderQualifiedName": (
-                            f"{self.tenant_id}/folder/{folder.get('id')}" if folder.get("id") else None
+                            f"{self.tenant_id}/folder/{folder_id}" if folder_id else None
                         ),
+                        **self._base_custom_attributes(workflow_id, workflow_run_id),
                     },
-                    "customAttributes": self._base_custom_attributes(workflow_id, workflow_run_id),
                 }
             )
         return entities

@@ -184,6 +184,9 @@ class ClientClass:
     def get_model_yaml(self, model_id: str, mode: str = "combined") -> dict[str, Any]:
         return self._get_json(f"/v1/models/{model_id}/yaml", params={"mode": mode})
 
+    def get_document(self, identifier: str) -> dict[str, Any]:
+        return self._get_json(f"/v1/documents/{identifier}")
+
     @staticmethod
     def _paginate(response: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
         records = response.get("records", []) or []
@@ -235,16 +238,32 @@ class ClientClass:
                     parsed = yaml.safe_load(file_content) or {}
                 except yaml.YAMLError:
                     continue
-                if not parsed.get("name"):
+                # Omni topic YAML has no "name" field; derive it from the filename stem.
+                topic_name = parsed.get("name") or file_name.removesuffix(".topic")
+                if not topic_name:
                     continue
                 topics.append(
                     {
                         "modelId": model_id,
-                        "name": parsed.get("name"),
+                        "name": topic_name,
                         "label": parsed.get("label"),
-                        "baseViewName": parsed.get("base_view_name"),
+                        "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
                     }
                 )
+
+        # Fetch detail for each document to get the backing modelId.
+        document_model_ids: set[str] = set()
+        for doc in documents:
+            identifier = doc.get("identifier")
+            if not identifier:
+                continue
+            try:
+                detail = self.get_document(identifier)
+                model_id = detail.get("modelId")
+                if model_id:
+                    document_model_ids.add(model_id)
+            except Exception:
+                continue
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))
@@ -257,4 +276,5 @@ class ClientClass:
             "folders": folders,
             "documents": documents,
             "topics": topics,
+            "document_model_ids": document_model_ids,
         }

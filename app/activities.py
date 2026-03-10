@@ -1,4 +1,4 @@
-import json
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -6,6 +6,8 @@ from app.client import NonRetryableOmniApiError, OmniApiError
 from app.handler import HandlerClass
 from app.transformer import OmniMetadataTransformer
 from application_sdk.activities import ActivitiesInterface
+from application_sdk.constants import TEMPORARY_PATH
+from application_sdk.io.json import JsonFileWriter
 from application_sdk.observability.logger_adaptor import get_logger
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -64,9 +66,18 @@ class ActivitiesClass(ActivitiesInterface):
             ),
             "timeout_seconds": _to_int(timeout_raw, 30),
         }
+
+        # output_path is set by the SDK's get_workflow_args; fall back to a local temp dir.
+        output_path = base_args.get("output_path") or os.path.join(
+            TEMPORARY_PATH,
+            base_args.get("workflow_id", "omni-extraction"),
+            base_args.get("workflow_run_id", "local-run"),
+        )
+
         return {
             "workflow_id": base_args.get("workflow_id", "omni-extraction"),
             "workflow_run_id": base_args.get("workflow_run_id", "local-run"),
+            "output_path": output_path,
             "credentials": credentials,
             "metadata": metadata,
         }
@@ -90,18 +101,29 @@ class ActivitiesClass(ActivitiesInterface):
             workflow_run_id=args.get("workflow_run_id", "local-run"),
         )
 
-        output_file = args["metadata"]["output_file"]
-        if args["metadata"]["save_output_local"]:
-            output_path = Path(output_file)
-            with output_path.open("w", encoding="utf-8") as handle:
+        # Write entities via the SDK writer, which uploads to the Atlan object store
+        # (when ENABLE_ATLAN_UPLOAD=true in production) or writes locally (in dev).
+        writer = JsonFileWriter(
+            path=args["output_path"],
+            typename="omni_entities",
+            retain_local_copy=args["metadata"].get("save_output_local", True),
+        )
+        await writer.write(entities)
+        stats = await writer.close()
+
+        # Optional additional local debug write at the user-specified output_file path.
+        if args["metadata"].get("save_output_local"):
+            import json
+            output_path_local = Path(args["metadata"]["output_file"])
+            with output_path_local.open("w", encoding="utf-8") as handle:
                 for entity in entities:
                     handle.write(json.dumps(entity))
                     handle.write("\n")
 
         return {
             "success": True,
-            "entity_count": len(entities),
-            "output_file": output_file if args["metadata"]["save_output_local"] else None,
+            "entity_count": stats.total_record_count,
+            "output_path": args["output_path"],
             "snapshot_counts": {
                 "connections": len(snapshot.get("connections", [])),
                 "models": len(snapshot.get("models", [])),
