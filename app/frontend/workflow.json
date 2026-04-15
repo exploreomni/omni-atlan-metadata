@@ -17,6 +17,7 @@
         "type": "string",
         "required": true,
         "ui": {
+          "widget": "password",
           "label": "Omni API Token",
           "placeholder": "Paste organization API key or PAT",
           "grid": 8
