@@ -29,6 +29,12 @@ class OmniCredentials:
     verify_ssl: bool = True
     timeout_seconds: int = 30
 
+    def __repr__(self) -> str:
+        return (
+            f"OmniCredentials(base_url={self.base_url!r}, api_token='***', "
+            f"verify_ssl={self.verify_ssl}, timeout_seconds={self.timeout_seconds})"
+        )
+
 
 class OmniApiError(RuntimeError):
     def __init__(
@@ -135,7 +141,7 @@ class ClientClass:
                     time.sleep(delay)
                     continue
                 raise OmniApiError(
-                    f"GET {path} rate-limited after retries: {response.text}",
+                    f"GET {path} rate-limited after retries: {status}",
                     status_code=status,
                     retryable=True,
                 )
@@ -146,13 +152,13 @@ class ClientClass:
                     time.sleep(delay)
                     continue
                 raise OmniApiError(
-                    f"GET {path} failed after server retries: {status} {response.text}",
+                    f"GET {path} failed after server retries: {status}",
                     status_code=status,
                     retryable=True,
                 )
 
             raise NonRetryableOmniApiError(
-                f"GET {path} failed: {status} {response.text}",
+                f"GET {path} failed: {status}",
                 status_code=status,
                 retryable=False,
             )
