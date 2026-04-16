@@ -29,6 +29,14 @@ class OmniMetadataTransformer:
             "connector_name": "omni",
         }
 
+    @staticmethod
+    def _rel_ref(type_name: str, qualified_name: str) -> dict[str, Any]:
+        """Build an Atlas relationship reference by qualified name."""
+        return {
+            "typeName": type_name,
+            "uniqueAttributes": {"qualifiedName": qualified_name},
+        }
+
     def _connections(
         self,
         records: list[dict[str, Any]],
@@ -75,25 +83,35 @@ class OmniMetadataTransformer:
                     continue
             conn_id = row.get("connectionId")
             base_model_id = row.get("baseModelId")
-            entities.append(
-                {
-                    "typeName": "omni_model",
-                    "attributes": {
-                        "qualifiedName": f"{self.tenant_id}/model/{model_id}",
-                        "name": row.get("name") or model_id,
-                        "omniId": model_id,
-                        "modelKind": row.get("modelKind"),
-                        "updatedAt": row.get("updatedAt"),
-                        "connectionQualifiedName": (
-                            f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
-                        ),
-                        "baseModelQualifiedName": (
-                            f"{self.tenant_id}/model/{base_model_id}" if base_model_id else None
-                        ),
-                        **self._base_custom_attributes(workflow_id, workflow_run_id),
-                    },
-                }
-            )
+            rel_attrs: dict[str, Any] = {}
+            if conn_id:
+                rel_attrs["connectionQualifiedName"] = self._rel_ref(
+                    "omni_connection", f"{self.tenant_id}/connection/{conn_id}"
+                )
+            if base_model_id:
+                rel_attrs["baseModelQualifiedName"] = self._rel_ref(
+                    "omni_model", f"{self.tenant_id}/model/{base_model_id}"
+                )
+            entity: dict[str, Any] = {
+                "typeName": "omni_model",
+                "attributes": {
+                    "qualifiedName": f"{self.tenant_id}/model/{model_id}",
+                    "name": row.get("name") or model_id,
+                    "omniId": model_id,
+                    "modelKind": row.get("modelKind"),
+                    "updatedAt": row.get("updatedAt"),
+                    "connectionQualifiedName": (
+                        f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
+                    ),
+                    "baseModelQualifiedName": (
+                        f"{self.tenant_id}/model/{base_model_id}" if base_model_id else None
+                    ),
+                    **self._base_custom_attributes(workflow_id, workflow_run_id),
+                },
+            }
+            if rel_attrs:
+                entity["relationshipAttributes"] = rel_attrs
+            entities.append(entity)
         return entities
 
     def _topics(
@@ -118,6 +136,11 @@ class OmniMetadataTransformer:
                         "baseViewName": row.get("baseViewName"),
                         "modelQualifiedName": f"{self.tenant_id}/model/{model_id}",
                         **self._base_custom_attributes(workflow_id, workflow_run_id),
+                    },
+                    "relationshipAttributes": {
+                        "modelQualifiedName": self._rel_ref(
+                            "omni_model", f"{self.tenant_id}/model/{model_id}"
+                        ),
                     },
                 }
             )
@@ -168,28 +191,38 @@ class OmniMetadataTransformer:
             doc_type = "omni_dashboard" if row.get("hasDashboard") else "omni_workbook"
             conn_id = row.get("connectionId")
             folder_id = folder.get("id")
-            entities.append(
-                {
-                    "typeName": doc_type,
-                    "attributes": {
-                        "qualifiedName": f"{self.tenant_id}/document/{identifier}",
-                        "name": row.get("name") or identifier,
-                        "omniId": identifier,
-                        "scope": row.get("scope"),
-                        "url": row.get("url"),
-                        "updatedAt": row.get("updatedAt"),
-                        "sourceType": row.get("type"),
-                        "ownerId": owner.get("id"),
-                        "ownerName": owner.get("name"),
-                        "folderPath": folder.get("path"),
-                        "connectionQualifiedName": (
-                            f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
-                        ),
-                        "folderQualifiedName": (
-                            f"{self.tenant_id}/folder/{folder_id}" if folder_id else None
-                        ),
-                        **self._base_custom_attributes(workflow_id, workflow_run_id),
-                    },
-                }
-            )
+            rel_attrs = {}
+            if conn_id:
+                rel_attrs["connectionQualifiedName"] = self._rel_ref(
+                    "omni_connection", f"{self.tenant_id}/connection/{conn_id}"
+                )
+            if folder_id:
+                rel_attrs["folderQualifiedName"] = self._rel_ref(
+                    "omni_folder", f"{self.tenant_id}/folder/{folder_id}"
+                )
+            entity = {
+                "typeName": doc_type,
+                "attributes": {
+                    "qualifiedName": f"{self.tenant_id}/document/{identifier}",
+                    "name": row.get("name") or identifier,
+                    "omniId": identifier,
+                    "scope": row.get("scope"),
+                    "url": row.get("url"),
+                    "updatedAt": row.get("updatedAt"),
+                    "sourceType": row.get("type"),
+                    "ownerId": owner.get("id"),
+                    "ownerName": owner.get("name"),
+                    "folderPath": folder.get("path"),
+                    "connectionQualifiedName": (
+                        f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
+                    ),
+                    "folderQualifiedName": (
+                        f"{self.tenant_id}/folder/{folder_id}" if folder_id else None
+                    ),
+                    **self._base_custom_attributes(workflow_id, workflow_run_id),
+                },
+            }
+            if rel_attrs:
+                entity["relationshipAttributes"] = rel_attrs
+            entities.append(entity)
         return entities

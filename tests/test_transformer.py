@@ -99,6 +99,7 @@ def test_connection_attributes():
 
 
 def test_connection_no_relationship_attributes_key():
+    # Connections have no outgoing cross-references so no relationship attributes expected.
     entities = transform()
     conn = next(e for e in entities if e["typeName"] == "omni_connection")
     assert "relationshipAttributes" not in conn
@@ -197,6 +198,63 @@ def test_workbook_null_refs():
     doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc2")
     assert doc["attributes"]["connectionQualifiedName"] is None
     assert doc["attributes"]["folderQualifiedName"] is None
+
+
+# ---------------------------------------------------------------------------
+# Relationship attributes
+# ---------------------------------------------------------------------------
+
+def test_model_connection_relationship_attr():
+    entities = transform()
+    models = [e for e in entities if e["typeName"] == "omni_model"]
+    base_model = next(m for m in models if m["attributes"]["omniId"] == "mod1")
+    rel = base_model["relationshipAttributes"]["connectionQualifiedName"]
+    assert rel["typeName"] == "omni_connection"
+    assert rel["uniqueAttributes"]["qualifiedName"] == "omni/connection/conn1"
+
+
+def test_model_without_connection_has_no_relationship_attributes():
+    t = OmniMetadataTransformer(tenant_id="omni")
+    result = t.transform(
+        {"connections": [], "models": [{"id": "m1", "name": "M", "modelKind": "base", "connectionId": None, "baseModelId": None}],
+         "topics": [], "folders": [], "documents": [], "document_model_ids": set()},
+        WF_ID, RUN_ID,
+    )
+    model = next(e for e in result if e["typeName"] == "omni_model")
+    assert "relationshipAttributes" not in model
+
+
+def test_derived_model_base_model_relationship_attr():
+    entities = transform()
+    models = [e for e in entities if e["typeName"] == "omni_model"]
+    derived = next(m for m in models if m["attributes"]["omniId"] == "mod2")
+    rel = derived["relationshipAttributes"]["baseModelQualifiedName"]
+    assert rel["typeName"] == "omni_model"
+    assert rel["uniqueAttributes"]["qualifiedName"] == "omni/model/mod1"
+
+
+def test_topic_model_relationship_attr():
+    entities = transform()
+    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
+    rel = orders["relationshipAttributes"]["modelQualifiedName"]
+    assert rel["typeName"] == "omni_model"
+    assert rel["uniqueAttributes"]["qualifiedName"] == "omni/model/mod1"
+
+
+def test_dashboard_relationship_attrs():
+    entities = transform()
+    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc1")
+    rel_attrs = doc["relationshipAttributes"]
+    assert rel_attrs["connectionQualifiedName"]["typeName"] == "omni_connection"
+    assert rel_attrs["connectionQualifiedName"]["uniqueAttributes"]["qualifiedName"] == "omni/connection/conn1"
+    assert rel_attrs["folderQualifiedName"]["typeName"] == "omni_folder"
+    assert rel_attrs["folderQualifiedName"]["uniqueAttributes"]["qualifiedName"] == "omni/folder/fold1"
+
+
+def test_workbook_no_refs_has_no_relationship_attributes():
+    entities = transform()
+    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc2")
+    assert "relationshipAttributes" not in doc
 
 
 # ---------------------------------------------------------------------------
