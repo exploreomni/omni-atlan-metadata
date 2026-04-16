@@ -48,7 +48,7 @@ async def test_defaults_when_state_empty():
     assert result["metadata"]["tenant_id"] == "omni"
     assert result["metadata"]["page_size"] == 50
     assert result["metadata"]["max_pages"] is None
-    assert result["metadata"]["save_output_local"] is True
+    assert result["metadata"]["save_output_local"] is False
     assert result["credentials"]["verify_ssl"] is True
     assert result["credentials"]["timeout_seconds"] == 30
 

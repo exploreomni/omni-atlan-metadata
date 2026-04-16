@@ -47,7 +47,7 @@ class ActivitiesClass(ActivitiesInterface):
             "tenant_id": tenant_id,
             "output_file": payload.get("output_file") or metadata_in.get("output_file") or "omni_entities.ndjson",
             "save_output_local": bool(
-                payload.get("save_output_local", metadata_in.get("save_output_local", True))
+                payload.get("save_output_local", metadata_in.get("save_output_local", False))
             ),
             "max_concurrency": _to_int(max_concurrency_raw, 10),
         }
@@ -108,7 +108,7 @@ class ActivitiesClass(ActivitiesInterface):
         writer = JsonFileWriter(
             path=args["output_path"],
             typename="omni_entities",
-            retain_local_copy=args["metadata"].get("save_output_local", True),
+            retain_local_copy=args["metadata"].get("save_output_local", False),
         )
         await writer.write(entities)
         stats = await writer.close()

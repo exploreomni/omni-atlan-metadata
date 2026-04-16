@@ -81,6 +81,7 @@
         "required": false,
         "ui": {
           "label": "Write NDJSON output locally",
+          "hidden": true,
           "grid": 5
         }
       },
@@ -89,6 +90,7 @@
         "required": false,
         "ui": {
           "label": "Output File",
+          "hidden": true,
           "placeholder": "omni_entities.ndjson",
           "grid": 5
         }
@@ -106,9 +108,7 @@
           "max_pages",
           "verify_ssl",
           "timeout_seconds",
-          "max_concurrency",
-          "save_output_local",
-          "output_file"
+          "max_concurrency"
         ]
       }
     ]
