@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 import random
@@ -221,55 +222,73 @@ class ClientClass:
                 break
         return rows
 
-    def fetch_snapshot(self, page_size: int = 50, max_pages: int | None = None) -> dict[str, Any]:
+    def _fetch_topics_for_model(self, model: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fetch and parse topics from a single model's YAML. Returns [] on any error."""
+        model_id = model.get("id")
+        if not model_id:
+            return []
+        try:
+            payload = self.get_model_yaml(model_id, mode="combined")
+        except Exception:
+            return []
+        topics: list[dict[str, Any]] = []
+        files = payload.get("files", {}) or {}
+        for file_name, file_content in files.items():
+            if not file_name.endswith(".topic"):
+                continue
+            try:
+                parsed = yaml.safe_load(file_content) or {}
+            except yaml.YAMLError:
+                continue
+            # Omni topic YAML has no "name" field; derive it from the filename stem.
+            topic_name = parsed.get("name") or file_name.removesuffix(".topic")
+            if not topic_name:
+                continue
+            topics.append(
+                {
+                    "modelId": model_id,
+                    "name": topic_name,
+                    "label": parsed.get("label"),
+                    "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
+                }
+            )
+        return topics
+
+    def _resolve_document_model_id(self, doc: dict[str, Any]) -> str | None:
+        """Fetch document detail to resolve the backing modelId. Returns None on any error."""
+        identifier = doc.get("identifier")
+        if not identifier:
+            return None
+        try:
+            detail = self.get_document(identifier)
+            return detail.get("modelId")
+        except Exception:
+            return None
+
+    def fetch_snapshot(
+        self,
+        page_size: int = 50,
+        max_pages: int | None = None,
+        max_concurrency: int = 10,
+    ) -> dict[str, Any]:
         connections = self.list_connections()
         models = self._collect_paginated(self.list_models, page_size, max_pages)
         folders = self._collect_paginated(self.list_folders, page_size, max_pages)
         documents = self._collect_paginated(self.list_documents, page_size, max_pages)
 
+        # Fetch model YAMLs and document details concurrently in a shared pool.
+        # Both batches are submitted together so they overlap in flight.
         topics: list[dict[str, Any]] = []
-        for model in models:
-            model_id = model.get("id")
-            if not model_id:
-                continue
-            try:
-                payload = self.get_model_yaml(model_id, mode="combined")
-            except Exception:
-                continue
-            files = payload.get("files", {}) or {}
-            for file_name, file_content in files.items():
-                if not file_name.endswith(".topic"):
-                    continue
-                try:
-                    parsed = yaml.safe_load(file_content) or {}
-                except yaml.YAMLError:
-                    continue
-                # Omni topic YAML has no "name" field; derive it from the filename stem.
-                topic_name = parsed.get("name") or file_name.removesuffix(".topic")
-                if not topic_name:
-                    continue
-                topics.append(
-                    {
-                        "modelId": model_id,
-                        "name": topic_name,
-                        "label": parsed.get("label"),
-                        "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
-                    }
-                )
-
-        # Fetch detail for each document to get the backing modelId.
         document_model_ids: set[str] = set()
-        for doc in documents:
-            identifier = doc.get("identifier")
-            if not identifier:
-                continue
-            try:
-                detail = self.get_document(identifier)
-                model_id = detail.get("modelId")
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            model_futures = [executor.submit(self._fetch_topics_for_model, m) for m in models]
+            doc_futures = [executor.submit(self._resolve_document_model_id, d) for d in documents]
+            for future in model_futures:
+                topics.extend(future.result())
+            for future in doc_futures:
+                model_id = future.result()
                 if model_id:
                     document_model_ids.add(model_id)
-            except Exception:
-                continue
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))

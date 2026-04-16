@@ -34,6 +34,7 @@ class ActivitiesClass(ActivitiesInterface):
         page_size_raw = payload.get("page_size") or metadata_in.get("page_size") or 50
         max_pages_raw = payload.get("max_pages") or metadata_in.get("max_pages")
         timeout_raw = payload.get("timeout_seconds") or metadata_in.get("timeout_seconds") or 30
+        max_concurrency_raw = payload.get("max_concurrency") or metadata_in.get("max_concurrency") or 10
 
         def _to_int(value: Any, default: int | None = None) -> int | None:
             if value in (None, "", "null"):
@@ -48,6 +49,7 @@ class ActivitiesClass(ActivitiesInterface):
             "save_output_local": bool(
                 payload.get("save_output_local", metadata_in.get("save_output_local", True))
             ),
+            "max_concurrency": _to_int(max_concurrency_raw, 10),
         }
 
         credentials = {

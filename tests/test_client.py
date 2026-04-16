@@ -168,6 +168,140 @@ def test_fetch_snapshot_parses_topics():
 
 
 @respx.mock
+def test_fetch_snapshot_fetches_yaml_for_multiple_models_concurrently():
+    """All model YAML calls are made regardless of ordering — concurrent fetch."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [{"id": "mod1"}, {"id": "mod2"}],
+                "pageInfo": {"hasNextPage": False},
+            },
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    yaml1 = "label: Orders\nbase_view_name: orders_view\n"
+    yaml2 = "label: Customers\nbase_view_name: customers_view\n"
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml1}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod2/yaml").mock(
+        return_value=httpx.Response(200, json={"files": {"customers.topic": yaml2}})
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    topic_model_ids = {t["modelId"] for t in snapshot["topics"]}
+    assert topic_model_ids == {"mod1", "mod2"}
+    assert len(snapshot["topics"]) == 2
+
+
+@respx.mock
+def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
+    """A failed YAML call for one model does not abort the rest of the batch."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [{"id": "mod1"}, {"id": "mod2"}],
+                "pageInfo": {"hasNextPage": False},
+            },
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
+        return_value=httpx.Response(500, text="Server Error")
+    )
+    yaml2 = "label: Customers\nbase_view_name: customers_view\n"
+    respx.get("https://test.omniapp.co/api/v1/models/mod2/yaml").mock(
+        return_value=httpx.Response(200, json={"files": {"customers.topic": yaml2}})
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    assert len(snapshot["topics"]) == 1
+    assert snapshot["topics"][0]["modelId"] == "mod2"
+
+
+@respx.mock
+def test_fetch_snapshot_resolves_document_model_ids_concurrently():
+    """Document detail calls are made for all documents and model IDs collected."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [{"identifier": "doc1"}, {"identifier": "doc2"}],
+                "pageInfo": {"hasNextPage": False},
+            },
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/doc1").mock(
+        return_value=httpx.Response(200, json={"modelId": "mod1"})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/doc2").mock(
+        return_value=httpx.Response(200, json={"modelId": "mod2"})
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    assert snapshot["document_model_ids"] == {"mod1", "mod2"}
+
+
+@respx.mock
+def test_fetch_snapshot_document_detail_failure_skips_but_continues():
+    """A failed document detail call does not abort the rest of the batch."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [{"identifier": "doc1"}, {"identifier": "doc2"}],
+                "pageInfo": {"hasNextPage": False},
+            },
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/doc1").mock(
+        return_value=httpx.Response(500, text="Server Error")
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/doc2").mock(
+        return_value=httpx.Response(200, json={"modelId": "mod2"})
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    assert snapshot["document_model_ids"] == {"mod2"}
+
+
+@respx.mock
 def test_fetch_snapshot_skips_non_topic_files():
     respx.get("https://test.omniapp.co/api/v1/connections").mock(
         return_value=httpx.Response(200, json={"connections": []})
