@@ -67,11 +67,21 @@
           "grid": 3
         }
       },
+      "max_concurrency": {
+        "type": "integer",
+        "required": false,
+        "ui": {
+          "label": "Max Concurrent API Calls",
+          "placeholder": "10",
+          "grid": 4
+        }
+      },
       "save_output_local": {
         "type": "boolean",
         "required": false,
         "ui": {
           "label": "Write NDJSON output locally",
+          "hidden": true,
           "grid": 5
         }
       },
@@ -80,6 +90,7 @@
         "required": false,
         "ui": {
           "label": "Output File",
+          "hidden": true,
           "placeholder": "omni_entities.ndjson",
           "grid": 5
         }
@@ -97,8 +108,7 @@
           "max_pages",
           "verify_ssl",
           "timeout_seconds",
-          "save_output_local",
-          "output_file"
+          "max_concurrency"
         ]
       }
     ]

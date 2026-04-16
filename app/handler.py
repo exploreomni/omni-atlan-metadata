@@ -45,7 +45,12 @@ class HandlerClass(HandlerInterface):
         page_size = int(metadata.get("page_size", 50))
         max_pages = metadata.get("max_pages")
         max_pages = int(max_pages) if max_pages not in (None, "", "null") else None
-        return self.client.fetch_snapshot(page_size=page_size, max_pages=max_pages)
+        max_concurrency = int(metadata.get("max_concurrency", 10))
+        return self.client.fetch_snapshot(
+            page_size=page_size,
+            max_pages=max_pages,
+            max_concurrency=max_concurrency,
+        )
 
     @staticmethod
     async def get_configmap(config_map_id: str) -> Dict[str, Any]:
