@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -41,6 +42,25 @@ class ActivitiesClass(ActivitiesInterface):
                 return default
             return int(value)
 
+        def _to_str_str_map(value: Any) -> dict[str, str]:
+            """Coerce a JSON string or dict into {str: str}; tolerate empties."""
+            if not value:
+                return {}
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (ValueError, TypeError):
+                    logger.warning("atlan_source_connection_map is not valid JSON; ignoring.")
+                    return {}
+            if not isinstance(value, dict):
+                return {}
+            return {str(k): str(v) for k, v in value.items() if k and v}
+
+        atlan_source_connection_map = _to_str_str_map(
+            payload.get("atlan_source_connection_map")
+            or metadata_in.get("atlan_source_connection_map")
+        )
+
         metadata: dict[str, Any] = {
             "page_size": _to_int(page_size_raw, 50),
             "max_pages": _to_int(max_pages_raw, None),
@@ -50,6 +70,7 @@ class ActivitiesClass(ActivitiesInterface):
                 payload.get("save_output_local", metadata_in.get("save_output_local", False))
             ),
             "max_concurrency": _to_int(max_concurrency_raw, 10),
+            "atlan_source_connection_map": atlan_source_connection_map,
         }
 
         credentials = {
@@ -96,7 +117,10 @@ class ActivitiesClass(ActivitiesInterface):
         except OmniApiError as exc:
             raise ApplicationError(str(exc), non_retryable=not exc.retryable) from exc
 
-        transformer = OmniMetadataTransformer(tenant_id=args["metadata"]["tenant_id"])
+        transformer = OmniMetadataTransformer(
+            tenant_id=args["metadata"]["tenant_id"],
+            atlan_source_connection_map=args["metadata"].get("atlan_source_connection_map", {}),
+        )
         entities = transformer.transform(
             snapshot=snapshot,
             workflow_id=args.get("workflow_id", "omni-extraction"),

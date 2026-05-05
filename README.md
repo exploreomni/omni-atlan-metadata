@@ -114,6 +114,7 @@ uv run pytest tests/ -v
 | `timeout_seconds` | No | HTTP request timeout in seconds (default: `30`) |
 | `save_output_local` | No | Also write a local NDJSON file for debugging (default: `true`) |
 | `output_file` | No | Path for the local debug file (default: `omni_entities.ndjson`) |
+| `atlan_source_connection_map` | No | JSON object mapping Omni connection IDs to Atlan source-database connection qualifiedNames, e.g. `{"omni-conn-id": "default/snowflake/1700000000"}`. When set, the connector emits Source-Table → Topic lineage processes that link to the database tables Atlan has already crawled. Database-agnostic — works with Snowflake, Redshift, BigQuery, Postgres, etc. |
 
 ## Deployment to Atlan
 
