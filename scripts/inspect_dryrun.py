@@ -131,11 +131,21 @@ def section_topic_enrichment(entities: list[dict[str, Any]]) -> list[str]:
         _kv("dimensions count", len(attrs.get("dimensionNames") or []))
         _kv("measures count", len(attrs.get("measureNames") or []))
 
+    # Topics with any enrichment signal (dims/measures/joinedViews) = API call succeeded.
+    # Missing sourceTableName on those is expected for query-based/semantic views.
+    api_succeeded = sum(
+        1 for t in topics
+        if t["attributes"].get("joinedViewNames") is not None
+        or t["attributes"].get("dimensionNames") is not None
+    )
+    api_failed = n - api_succeeded
+    _kv("topic detail API succeeded", f"{api_succeeded}/{n}")
+
     warnings = []
     if has_source == 0:
         warnings.append("ZERO topics have sourceTableName — topic API call may be failing or response shape is unexpected")
-    elif has_source < n:
-        warnings.append(f"{n - has_source}/{n} topics missing source table (some failed enrichment)")
+    if api_failed > 0:
+        warnings.append(f"{api_failed}/{n} topics had no enrichment at all — topic detail API may be failing for some topics")
     return warnings
 
 

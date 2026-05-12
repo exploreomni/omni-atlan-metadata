@@ -250,7 +250,10 @@ class ClientClass:
             except yaml.YAMLError:
                 continue
             # Omni topic YAML has no "name" field; derive it from the filename stem.
-            topic_name = parsed.get("name") or file_name.removesuffix(".topic")
+            # Filenames may include a group prefix (e.g. "COCO_DEMO/podcast_streaming.topic");
+            # the topic API only accepts the bare stem without the directory prefix.
+            stem = file_name.removesuffix(".topic").split("/")[-1]
+            topic_name = parsed.get("name") or stem
             if not topic_name:
                 continue
             topic = {
