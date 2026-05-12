@@ -5,8 +5,11 @@ Atlan custom connector that crawls metadata from [Omni Analytics](https://omni.c
 ## What this connector does
 
 - Authenticates to Omni REST APIs using an API token.
-- Extracts **connections**, **models**, **topics** (parsed from model YAML), **folders**, and **documents** (dashboards and workbooks).
+- Extracts **connections**, **models**, **folders**, and **documents** (dashboards and workbooks).
+- Enumerates **topics** from each model's YAML and enriches them via `GET /v1/models/{modelId}/topic/{topicName}` to capture base-view source-table identity, joined views, dimensions, and measures.
+- Resolves each dashboard's per-tile topics via `queryPresentations[].topicName` from the document detail API.
 - Registers six custom entity types in Atlan (`omni_connection`, `omni_model`, `omni_topic`, `omni_folder`, `omni_dashboard`, `omni_workbook`) on first startup.
+- Emits Atlan `Process` entities for **Topic → Dashboard** lineage and (when configured) **Source Table → Topic** lineage so the relationships render in Atlan's lineage graph.
 - Transforms extracted metadata into Atlan entities and uploads them via the Atlan Application SDK's object-store pipeline.
 
 ## Asset type hierarchy
@@ -33,7 +36,14 @@ Not all Omni models are synced to Atlan:
 
 Cross-references between types (e.g. `connectionQualifiedName`, `modelQualifiedName`) are stored as string attributes rather than Atlas relationship edges. This keeps the typedef schema simple and is sufficient for search, impact analysis, and asset browsing in Atlan.
 
-If richer BI lineage is needed in the future (assets appearing in Atlan's native BI views and lineage graph), the types can be migrated to extend Atlan's built-in BI supertypes (`BIReport`, etc.) and lineage `Process` entities can be added to link Omni topics to underlying database tables.
+## Lineage
+
+The connector emits Atlan `Process` entities so lineage edges render in Atlan's graph view. Two kinds:
+
+- **Topic → Dashboard / Workbook** — one Process per unique (topic, document) pair. Inputs are pulled from the document detail's `queryPresentations[].topicName`, deduped per document. Always emitted; no extra config required.
+- **Source Table → Topic** — one Process per topic, with one input per backing view (base + joined). Each view's source table qualifiedName is built from the user-supplied `atlan_source_connection_map` plus the view's `catalog`/`schema`/`table_name` returned by the topic API. When a view has no `catalog` (single-database connectors like Postgres), the Omni connection's `database` is used as the catalog. Database-agnostic — works with Snowflake, Redshift, BigQuery, Postgres, etc. **Disabled by default**; enable by setting `atlan_source_connection_map` (see Configuration).
+
+`Process` is Atlan's built-in supertype, so no custom typedef is registered for it. If a customer's source database hasn't been crawled in Atlan, source-table Process entities are still emitted but the lineage edge will not render until the table assets exist.
 
 ## App structure
 
@@ -114,6 +124,7 @@ uv run pytest tests/ -v
 | `timeout_seconds` | No | HTTP request timeout in seconds (default: `30`) |
 | `save_output_local` | No | Also write a local NDJSON file for debugging (default: `true`) |
 | `output_file` | No | Path for the local debug file (default: `omni_entities.ndjson`) |
+| `atlan_source_connection_map` | No | JSON object mapping Omni connection IDs to Atlan source-database connection qualifiedNames, e.g. `{"omni-conn-id": "default/snowflake/1700000000"}`. When set, the connector emits Source-Table → Topic lineage processes that link to the database tables Atlan has already crawled. Database-agnostic — works with Snowflake, Redshift, BigQuery, Postgres, etc. |
 
 ## Deployment to Atlan
 

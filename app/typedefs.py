@@ -23,6 +23,16 @@ def _str(name: str) -> AttributeDef:
     )
 
 
+def _str_array(name: str) -> AttributeDef:
+    """Return a nullable multi-value string AttributeDef."""
+    return AttributeDef(
+        name=name,
+        type_name="array<string>",
+        is_optional=True,
+        cardinality="LIST",
+    )
+
+
 # Sync-tracking attributes added to every entity type
 _SYNC_ATTRS: list[AttributeDef] = [
     _str("last_sync_workflow_name"),
@@ -64,6 +74,12 @@ ENTITY_DEFS: list[EntityDef] = [
             _str("omniName"),
             _str("baseViewName"),
             _str("modelQualifiedName"),
+            _str("sourceTableName"),
+            _str("sourceSchema"),
+            _str("sourceCatalog"),
+            _str_array("joinedViewNames"),
+            _str_array("dimensionNames"),
+            _str_array("measureNames"),
             *_SYNC_ATTRS,
         ],
     ),
@@ -93,6 +109,7 @@ ENTITY_DEFS: list[EntityDef] = [
             _str("folderPath"),
             _str("connectionQualifiedName"),
             _str("folderQualifiedName"),
+            _str_array("topicQualifiedNames"),
             *_SYNC_ATTRS,
         ],
     ),
@@ -110,6 +127,7 @@ ENTITY_DEFS: list[EntityDef] = [
             _str("folderPath"),
             _str("connectionQualifiedName"),
             _str("folderQualifiedName"),
+            _str_array("topicQualifiedNames"),
             *_SYNC_ATTRS,
         ],
     ),

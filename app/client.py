@@ -194,6 +194,9 @@ class ClientClass:
     def get_document(self, identifier: str) -> dict[str, Any]:
         return self._get_json(f"/v1/documents/{identifier}")
 
+    def get_topic(self, model_id: str, topic_name: str) -> dict[str, Any]:
+        return self._get_json(f"/v1/models/{model_id}/topic/{topic_name}")
+
     @staticmethod
     def _paginate(response: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
         records = response.get("records", []) or []
@@ -223,7 +226,13 @@ class ClientClass:
         return rows
 
     def _fetch_topics_for_model(self, model: dict[str, Any]) -> list[dict[str, Any]]:
-        """Fetch and parse topics from a single model's YAML. Returns [] on any error."""
+        """Fetch and parse topics from a single model's YAML, enriched via the topic API.
+
+        The model YAML is the source for enumerating topic names (no list endpoint
+        exists). For each topic, we additionally call the topic detail API to pull
+        source-table/schema/catalog, joined views, and dimension/measure names.
+        If the topic detail call fails, we still emit the basic topic from YAML.
+        """
         model_id = model.get("id")
         if not model_id:
             return []
@@ -241,29 +250,131 @@ class ClientClass:
             except yaml.YAMLError:
                 continue
             # Omni topic YAML has no "name" field; derive it from the filename stem.
-            topic_name = parsed.get("name") or file_name.removesuffix(".topic")
+            # Filenames may include a group prefix (e.g. "COCO_DEMO/podcast_streaming.topic");
+            # the topic API only accepts the bare stem without the directory prefix.
+            stem = file_name.removesuffix(".topic").split("/")[-1]
+            topic_name = parsed.get("name") or stem
             if not topic_name:
                 continue
-            topics.append(
-                {
-                    "modelId": model_id,
-                    "name": topic_name,
-                    "label": parsed.get("label"),
-                    "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
-                }
-            )
+            topic = {
+                "modelId": model_id,
+                "name": topic_name,
+                "label": parsed.get("label"),
+                "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
+            }
+            topic.update(self._fetch_topic_detail(model_id, topic_name))
+            topics.append(topic)
         return topics
 
-    def _resolve_document_model_id(self, doc: dict[str, Any]) -> str | None:
-        """Fetch document detail to resolve the backing modelId. Returns None on any error."""
+    def _fetch_topic_detail(self, model_id: str, topic_name: str) -> dict[str, Any]:
+        """Fetch enriched topic data via the topic API. Returns {} on any error.
+
+        Pulls from `GET /v1/models/{modelId}/topic/{topicName}`:
+        - base view's `table_name` / `schema` / `catalog` for source lineage
+        - names of joined views (excluding the base view)
+        - fully-qualified dimension and measure names across all included views
+        """
+        try:
+            payload = self.get_topic(model_id, topic_name)
+        except Exception:
+            return {}
+        try:
+            topic = payload.get("topic") or {}
+            views = topic.get("views") or []
+            base_view_name = topic.get("base_view_name")
+
+            base_view: dict[str, Any] = {}
+            joined_view_names: list[str] = []
+            dimension_names: list[str] = []
+            measure_names: list[str] = []
+            view_sources: list[dict[str, Any]] = []
+
+            for view in views:
+                if not isinstance(view, dict):
+                    continue
+                view_name = view.get("name")
+                if view_name == base_view_name:
+                    base_view = view
+                elif view_name:
+                    joined_view_names.append(view_name)
+                table_name = view.get("table_name")
+                if table_name:
+                    view_sources.append(
+                        {
+                            "viewName": view_name,
+                            "tableName": table_name,
+                            "schema": view.get("schema"),
+                            "catalog": view.get("catalog"),
+                        }
+                    )
+                for dim in view.get("dimensions") or []:
+                    if isinstance(dim, dict):
+                        fqn = dim.get("fully_qualified_name")
+                        if fqn:
+                            dimension_names.append(fqn)
+                for meas in view.get("measures") or []:
+                    if isinstance(meas, dict):
+                        fqn = meas.get("fully_qualified_name")
+                        if fqn:
+                            measure_names.append(fqn)
+
+            return {
+                "sourceTableName": base_view.get("table_name"),
+                "sourceSchema": base_view.get("schema"),
+                "sourceCatalog": base_view.get("catalog"),
+                "joinedViewNames": joined_view_names,
+                "dimensionNames": dimension_names,
+                "measureNames": measure_names,
+                "viewSources": view_sources,
+            }
+        except Exception:
+            return {}
+
+    def _fetch_document_detail(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """Fetch document detail and return enrichment fields. Returns {} on any error.
+
+        The Omni `GET /v1/documents/{id}` endpoint returns the backing modelId
+        and a `queryPresentations` array (one per dashboard tile/tab). Each
+        presentation may carry a `topicName` and a `query` object containing
+        its own `modelId`. We collect unique (modelId, topicName) pairs across
+        all presentations so the dashboard can be linked to the topics it uses.
+        """
         identifier = doc.get("identifier")
         if not identifier:
-            return None
+            return {}
         try:
             detail = self.get_document(identifier)
-            return detail.get("modelId")
         except Exception:
-            return None
+            return {}
+
+        try:
+            doc_model_id = detail.get("modelId")
+
+            tile_topics: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
+            for presentation in detail.get("queryPresentations") or []:
+                if not isinstance(presentation, dict):
+                    continue
+                topic_name = presentation.get("topicName")
+                if not topic_name:
+                    continue
+                inner_query = presentation.get("query") or {}
+                model_id = (
+                    inner_query.get("modelId") if isinstance(inner_query, dict) else None
+                ) or doc_model_id
+                if not model_id:
+                    continue
+                key = (model_id, topic_name)
+                if key not in seen:
+                    seen.add(key)
+                    tile_topics.append({"modelId": model_id, "topicName": topic_name})
+
+            return {
+                "modelId": doc_model_id,
+                "tileTopics": tile_topics,
+            }
+        except Exception:
+            return {}
 
     def fetch_snapshot(
         self,
@@ -282,13 +393,14 @@ class ClientClass:
         document_model_ids: set[str] = set()
         with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
             model_futures = [executor.submit(self._fetch_topics_for_model, m) for m in models]
-            doc_futures = [executor.submit(self._resolve_document_model_id, d) for d in documents]
+            doc_futures = [executor.submit(self._fetch_document_detail, d) for d in documents]
             for future in model_futures:
                 topics.extend(future.result())
-            for future in doc_futures:
-                model_id = future.result()
-                if model_id:
-                    document_model_ids.add(model_id)
+            for doc, future in zip(documents, doc_futures):
+                detail = future.result()
+                if detail.get("modelId"):
+                    document_model_ids.add(detail["modelId"])
+                doc.update(detail)
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))

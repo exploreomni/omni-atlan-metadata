@@ -139,3 +139,44 @@ async def test_workflow_ids_propagated():
     result = await _call_get_workflow_args({}, base)
     assert result["workflow_id"] == "my-wf"
     assert result["workflow_run_id"] == "my-run"
+
+
+# ---------------------------------------------------------------------------
+# atlan_source_connection_map normalization
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_source_connection_map_default_empty():
+    result = await _call_get_workflow_args({}, _make_base_args())
+    assert result["metadata"]["atlan_source_connection_map"] == {}
+
+
+@pytest.mark.asyncio
+async def test_source_connection_map_parses_json_string():
+    base = _make_base_args(
+        {"payload": {"atlan_source_connection_map": '{"c1": "default/snowflake/1700"}'}}
+    )
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["atlan_source_connection_map"] == {
+        "c1": "default/snowflake/1700"
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_connection_map_accepts_dict():
+    base = _make_base_args(
+        {"payload": {"atlan_source_connection_map": {"c1": "default/redshift/abc"}}}
+    )
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["atlan_source_connection_map"] == {
+        "c1": "default/redshift/abc"
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_connection_map_invalid_json_yields_empty():
+    base = _make_base_args(
+        {"payload": {"atlan_source_connection_map": "{not valid json"}}
+    )
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["atlan_source_connection_map"] == {}

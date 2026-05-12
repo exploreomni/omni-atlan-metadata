@@ -160,6 +160,10 @@ def test_fetch_snapshot_parses_topics():
     respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
         return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_content}})
     )
+    # Topic detail returns 404 — basic YAML data still flows through.
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/topic/orders").mock(
+        return_value=httpx.Response(404, text="Not found")
+    )
 
     snapshot = make_client().fetch_snapshot()
     assert snapshot["topics"] == [
@@ -196,6 +200,12 @@ def test_fetch_snapshot_fetches_yaml_for_multiple_models_concurrently():
     respx.get("https://test.omniapp.co/api/v1/models/mod2/yaml").mock(
         return_value=httpx.Response(200, json={"files": {"customers.topic": yaml2}})
     )
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod2/topic/customers").mock(
+        return_value=httpx.Response(404)
+    )
 
     snapshot = make_client().fetch_snapshot()
     topic_model_ids = {t["modelId"] for t in snapshot["topics"]}
@@ -230,6 +240,9 @@ def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
     yaml2 = "label: Customers\nbase_view_name: customers_view\n"
     respx.get("https://test.omniapp.co/api/v1/models/mod2/yaml").mock(
         return_value=httpx.Response(200, json={"files": {"customers.topic": yaml2}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod2/topic/customers").mock(
+        return_value=httpx.Response(404)
     )
 
     snapshot = make_client().fetch_snapshot()
@@ -299,6 +312,203 @@ def test_fetch_snapshot_document_detail_failure_skips_but_continues():
 
     snapshot = make_client().fetch_snapshot()
     assert snapshot["document_model_ids"] == {"mod2"}
+
+
+@respx.mock
+def test_fetch_snapshot_enriches_document_with_tile_topics():
+    """Document records are enriched with deduplicated tile topics from queryPresentations."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [{"identifier": "doc1"}],
+                "pageInfo": {"hasNextPage": False},
+            },
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/doc1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "modelId": "mod1",
+                "queryPresentations": [
+                    {"topicName": "orders", "query": {"modelId": "mod1"}},
+                    {"topicName": "customers", "query": {"modelId": "mod1"}},
+                    {"topicName": "orders", "query": {"modelId": "mod1"}},  # duplicate
+                    {"topicName": None},  # missing topic — skipped
+                ],
+            },
+        )
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    doc = snapshot["documents"][0]
+    tile_topics = doc["tileTopics"]
+    assert len(tile_topics) == 2  # duplicate and null deduped/skipped
+    assert {"modelId": "mod1", "topicName": "orders"} in tile_topics
+    assert {"modelId": "mod1", "topicName": "customers"} in tile_topics
+
+
+@respx.mock
+def test_fetch_snapshot_falls_back_to_doc_model_id_when_query_missing_model():
+    """When a presentation has no inner query.modelId, fall back to the document's modelId."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(
+            200,
+            json={"records": [{"identifier": "doc1"}], "pageInfo": {"hasNextPage": False}},
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/doc1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "modelId": "modX",
+                "queryPresentations": [{"topicName": "orders"}],
+            },
+        )
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    doc = snapshot["documents"][0]
+    assert doc["tileTopics"] == [{"modelId": "modX", "topicName": "orders"}]
+
+
+@respx.mock
+def test_fetch_snapshot_enriches_topic_with_source_table_and_fields():
+    """Topic API enrichment populates source table, joined views, dimensions, and measures."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={"records": [{"id": "mod1"}], "pageInfo": {"hasNextPage": False}},
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
+        return_value=httpx.Response(
+            200,
+            json={"files": {"orders.topic": "label: Orders\nbase_view_name: orders_view\n"}},
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/topic/orders").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "topic": {
+                    "name": "orders",
+                    "label": "Orders",
+                    "base_view_name": "orders_view",
+                    "views": [
+                        {
+                            "name": "orders_view",
+                            "table_name": "orders",
+                            "schema": "public",
+                            "catalog": "analytics",
+                            "dimensions": [
+                                {"fully_qualified_name": "orders_view.id"},
+                                {"fully_qualified_name": "orders_view.created_at"},
+                            ],
+                            "measures": [
+                                {"fully_qualified_name": "orders_view.total_revenue"},
+                            ],
+                        },
+                        {
+                            "name": "customers_view",
+                            "table_name": "customers",
+                            "schema": "public",
+                            "dimensions": [
+                                {"fully_qualified_name": "customers_view.email"},
+                            ],
+                            "measures": [],
+                        },
+                    ],
+                },
+            },
+        )
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    assert len(snapshot["topics"]) == 1
+    topic = snapshot["topics"][0]
+    assert topic["sourceTableName"] == "orders"
+    assert topic["sourceSchema"] == "public"
+    assert topic["sourceCatalog"] == "analytics"
+    assert topic["joinedViewNames"] == ["customers_view"]
+    assert topic["dimensionNames"] == [
+        "orders_view.id",
+        "orders_view.created_at",
+        "customers_view.email",
+    ]
+    assert topic["measureNames"] == ["orders_view.total_revenue"]
+    # viewSources collects every view that has a table_name (catalog optional).
+    assert topic["viewSources"] == [
+        {"viewName": "orders_view", "tableName": "orders", "schema": "public", "catalog": "analytics"},
+        {"viewName": "customers_view", "tableName": "customers", "schema": "public", "catalog": None},
+    ]
+
+
+@respx.mock
+def test_fetch_snapshot_topic_detail_failure_falls_back_to_yaml():
+    """If the topic detail API fails, the topic is still emitted with YAML-derived basics."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(
+            200,
+            json={"records": [{"id": "mod1"}], "pageInfo": {"hasNextPage": False}},
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
+        return_value=httpx.Response(
+            200,
+            json={"files": {"orders.topic": "label: Orders\nbase_view_name: orders_view\n"}},
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/mod1/topic/orders").mock(
+        return_value=httpx.Response(500, text="Server Error")
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    assert len(snapshot["topics"]) == 1
+    topic = snapshot["topics"][0]
+    assert topic["name"] == "orders"
+    assert topic["label"] == "Orders"
+    assert topic["baseViewName"] == "orders_view"
+    # Detail-only fields are absent when the topic API fails.
+    assert "sourceTableName" not in topic
 
 
 @respx.mock

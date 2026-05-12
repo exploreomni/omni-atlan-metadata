@@ -76,6 +76,16 @@
           "grid": 4
         }
       },
+      "atlan_source_connection_map": {
+        "type": "string",
+        "required": false,
+        "ui": {
+          "widget": "textarea",
+          "label": "Atlan Source Connection Map (optional, for Source Table -> Topic lineage)",
+          "placeholder": "{\"<omni_connection_id>\": \"default/snowflake/1700000000\"}",
+          "grid": 8
+        }
+      },
       "save_output_local": {
         "type": "boolean",
         "required": false,
@@ -108,7 +118,8 @@
           "max_pages",
           "verify_ssl",
           "timeout_seconds",
-          "max_concurrency"
+          "max_concurrency",
+          "atlan_source_connection_map"
         ]
       }
     ]
