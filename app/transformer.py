@@ -1,34 +1,66 @@
+"""Omni snapshot -> Atlan entity transformer.
+
+Emits entities aligned with Atlan partner typedef reference v0 (2026-05-15):
+- Four concrete types: OmniV01Model, OmniV01Topic, OmniV01Folder, OmniV01Document
+- All extend abstract OmniV01 (which extends BI -> Catalog -> Asset)
+- Standard Asset.* fields (name, description, sourceURL, sourceUpdatedAt,
+  ownerUsers) are populated where Omni exposes the data
+- Typed Atlas relationship edges (not string-QN attributes) for model->topic,
+  model->baseModel, folder->document, and the built-in Connection edge
+- Warehouse->Topic and Topic->Document lineage flow through standard Process
+  entities so Atlan's lineage UI/SDK renders them out of the box
+
+The previously-shipped omni_connection, omni_dashboard, and omni_workbook
+custom types are retired. The Atlan-side Connection (created out-of-band by
+the operator) is referenced via the canonical
+default/omni/{connection_epoch_ms} qualifiedName.
+"""
+
 from __future__ import annotations
 
 from typing import Any
+
+# Atlan-side enum value sets — defensive normalization for upstream Omni
+# strings that may arrive in mixed casing. Values not in these sets are
+# dropped rather than emitted as invalid enums. Document type is derived
+# deterministically from `hasDashboard`, not normalized from a string.
+_MODEL_KINDS = {"SHARED", "WORKBOOK"}
+_SCOPES = {"ORGANIZATION", "WORKSPACE", "PRIVATE", "SHARED"}
 
 
 class OmniMetadataTransformer:
     def __init__(
         self,
-        tenant_id: str,
+        connection_epoch_ms: str,
         atlan_source_connection_map: dict[str, str] | None = None,
     ):
-        self.tenant_id = tenant_id or "omni"
-        # Maps an Omni connection ID to the Atlan qualifiedName of the
-        # corresponding source-database connection (Snowflake, Redshift, etc.).
-        # Used to emit Source-Table -> Topic lineage; empty map disables it.
+        if not connection_epoch_ms or not str(connection_epoch_ms).isdigit():
+            raise ValueError(
+                "connection_epoch_ms is required and must be a digit string."
+            )
+        self.connection_epoch_ms = str(connection_epoch_ms)
+        self.connection_qn = f"default/omni/{self.connection_epoch_ms}"
+        # Omni-connection-id -> Atlan source-connection qualifiedName (e.g.
+        # the Snowflake/BigQuery connection that backs an Omni model).
+        # Drives source-table -> topic Process emission only.
         self.atlan_source_connection_map = atlan_source_connection_map or {}
+
+    # ------------------------------------------------------------------ #
+    # Public entrypoint
+    # ------------------------------------------------------------------ #
 
     def transform(
         self,
         snapshot: dict[str, Any],
-        workflow_id: str,
-        workflow_run_id: str,
     ) -> list[dict[str, Any]]:
-        document_model_ids: set[str] = snapshot.get("document_model_ids", set())
+        document_model_ids: list[str] = snapshot.get("document_model_ids", []) or []
         documents = snapshot.get("documents", [])
         connections = snapshot.get("connections", [])
         models = snapshot.get("models", [])
         topics = snapshot.get("topics", [])
+        folders = snapshot.get("folders", [])
 
-        # Build lookups for cross-referencing topics back to their connection
-        # so we can resolve the Atlan source-connection qualifiedName.
+        # Lookups for source-table lineage resolution.
         model_to_connection: dict[str, str] = {
             m["id"]: m.get("connectionId")
             for m in models
@@ -41,68 +73,64 @@ class OmniMetadataTransformer:
         }
 
         entities: list[dict[str, Any]] = []
-        entities.extend(self._connections(connections, workflow_id, workflow_run_id))
-        entities.extend(self._models(models, workflow_id, workflow_run_id, document_model_ids))
-        entities.extend(self._topics(topics, workflow_id, workflow_run_id))
-        entities.extend(self._folders(snapshot.get("folders", []), workflow_id, workflow_run_id))
-        entities.extend(self._documents(documents, workflow_id, workflow_run_id))
-        entities.extend(self._processes_topic_to_dashboard(documents))
+        entities.extend(self._models(models, document_model_ids))
+        entities.extend(self._topics(topics))
+        entities.extend(self._folders(folders))
+        entities.extend(self._documents(documents))
+        entities.extend(self._processes_topic_to_document(documents))
         entities.extend(
             self._processes_source_to_topic(
-                topics,
-                model_to_connection,
-                connection_to_database,
+                topics, model_to_connection, connection_to_database
             )
         )
         return entities
 
-    def _base_custom_attributes(self, workflow_id: str, workflow_run_id: str) -> dict[str, str]:
-        return {
-            "last_sync_workflow_name": workflow_id,
-            "last_sync_run": workflow_run_id,
-            "connector_name": "omni",
-        }
+    # ------------------------------------------------------------------ #
+    # Qualified-name + relationship helpers
+    # ------------------------------------------------------------------ #
+
+    def _model_qn(self, model_id: str) -> str:
+        return f"{self.connection_qn}/model/{model_id}"
+
+    def _topic_qn(self, model_id: str, topic_name: str) -> str:
+        return f"{self.connection_qn}/model/{model_id}/topic/{topic_name}"
+
+    def _folder_qn(self, folder_id: str) -> str:
+        return f"{self.connection_qn}/folder/{folder_id}"
+
+    def _document_qn(self, identifier: str) -> str:
+        return f"{self.connection_qn}/document/{identifier}"
 
     @staticmethod
     def _rel_ref(type_name: str, qualified_name: str) -> dict[str, Any]:
-        """Build an Atlas relationship reference by qualified name."""
         return {
             "typeName": type_name,
             "uniqueAttributes": {"qualifiedName": qualified_name},
         }
 
-    def _connections(
-        self,
-        records: list[dict[str, Any]],
-        workflow_id: str,
-        workflow_run_id: str,
-    ) -> list[dict[str, Any]]:
-        entities: list[dict[str, Any]] = []
-        for row in records:
-            omni_id = row.get("id")
-            if not omni_id:
-                continue
-            entities.append(
-                {
-                    "typeName": "omni_connection",
-                    "attributes": {
-                        "qualifiedName": f"{self.tenant_id}/connection/{omni_id}",
-                        "name": row.get("name") or omni_id,
-                        "omniId": omni_id,
-                        "dialect": row.get("dialect"),
-                        "database": row.get("database"),
-                        **self._base_custom_attributes(workflow_id, workflow_run_id),
-                    },
-                }
-            )
-        return entities
+    @staticmethod
+    def _normalize_enum(value: Any, allowed: set[str]) -> str | None:
+        if not value:
+            return None
+        normalized = str(value).strip().upper()
+        return normalized if normalized in allowed else None
+
+    @staticmethod
+    def _owner_users(owner: dict[str, Any] | None) -> list[str] | None:
+        if not owner:
+            return None
+        # Prefer email/username over display name for Atlan owner refs.
+        candidate = owner.get("email") or owner.get("username") or owner.get("name")
+        return [candidate] if candidate else None
+
+    # ------------------------------------------------------------------ #
+    # Entity builders
+    # ------------------------------------------------------------------ #
 
     def _models(
         self,
         records: list[dict[str, Any]],
-        workflow_id: str,
-        workflow_run_id: str,
-        document_model_ids: set[str] | None = None,
+        document_model_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
         for row in records:
@@ -115,44 +143,53 @@ class OmniMetadataTransformer:
             if row.get("modelKind") == "WORKBOOK" and not row.get("name"):
                 if document_model_ids is None or model_id not in document_model_ids:
                     continue
-            conn_id = row.get("connectionId")
-            base_model_id = row.get("baseModelId")
-            rel_attrs: dict[str, Any] = {}
-            if conn_id:
-                rel_attrs["connectionQualifiedName"] = self._rel_ref(
-                    "omni_connection", f"{self.tenant_id}/connection/{conn_id}"
-                )
-            if base_model_id:
-                rel_attrs["baseModelQualifiedName"] = self._rel_ref(
-                    "omni_model", f"{self.tenant_id}/model/{base_model_id}"
-                )
-            entity: dict[str, Any] = {
-                "typeName": "omni_model",
-                "attributes": {
-                    "qualifiedName": f"{self.tenant_id}/model/{model_id}",
-                    "name": row.get("name") or model_id,
-                    "omniId": model_id,
-                    "modelKind": row.get("modelKind"),
-                    "updatedAt": row.get("updatedAt"),
-                    "connectionQualifiedName": (
-                        f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
-                    ),
-                    "baseModelQualifiedName": (
-                        f"{self.tenant_id}/model/{base_model_id}" if base_model_id else None
-                    ),
-                    **self._base_custom_attributes(workflow_id, workflow_run_id),
-                },
+
+            model_kind = self._normalize_enum(row.get("modelKind"), _MODEL_KINDS)
+            if not model_kind:
+                # The typedef makes omniV01ModelKind required; without a valid
+                # value we can't emit a conformant entity.
+                continue
+
+            qn = self._model_qn(model_id)
+            attrs: dict[str, Any] = {
+                "qualifiedName": qn,
+                "name": row.get("name") or model_id,
+                "connectorName": "omni",
+                "omniV01Id": model_id,
+                "omniV01ModelKind": model_kind,
+                "sourceUpdatedAt": row.get("updatedAt"),
             }
-            if rel_attrs:
-                entity["relationshipAttributes"] = rel_attrs
-            entities.append(entity)
+            description = row.get("description")
+            if description:
+                attrs["description"] = description
+            scope = self._normalize_enum(row.get("scope"), _SCOPES)
+            if scope:
+                attrs["omniV01Scope"] = scope
+            owner_users = self._owner_users(row.get("owner") or {"name": row.get("ownerName")})
+            if owner_users:
+                attrs["ownerUsers"] = owner_users
+
+            rel_attrs: dict[str, Any] = {
+                "connection": self._rel_ref("Connection", self.connection_qn),
+            }
+            base_model_id = row.get("baseModelId")
+            if base_model_id:
+                rel_attrs["baseModel"] = self._rel_ref(
+                    "OmniV01Model", self._model_qn(base_model_id)
+                )
+
+            entities.append(
+                {
+                    "typeName": "OmniV01Model",
+                    "attributes": attrs,
+                    "relationshipAttributes": rel_attrs,
+                }
+            )
         return entities
 
     def _topics(
         self,
         records: list[dict[str, Any]],
-        workflow_id: str,
-        workflow_run_id: str,
     ) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
         for row in records:
@@ -160,27 +197,25 @@ class OmniMetadataTransformer:
             topic_name = row.get("name")
             if not model_id or not topic_name:
                 continue
+            qn = self._topic_qn(model_id, topic_name)
+            attrs: dict[str, Any] = {
+                "qualifiedName": qn,
+                "name": row.get("label") or topic_name,
+                "connectorName": "omni",
+                "omniV01Id": topic_name,
+                "omniV01BaseViewName": row.get("baseViewName"),
+                "sourceUpdatedAt": row.get("updatedAt"),
+            }
+            description = row.get("description")
+            if description:
+                attrs["description"] = description
+
             entities.append(
                 {
-                    "typeName": "omni_topic",
-                    "attributes": {
-                        "qualifiedName": f"{self.tenant_id}/model/{model_id}/topic/{topic_name}",
-                        "name": row.get("label") or topic_name,
-                        "omniName": topic_name,
-                        "baseViewName": row.get("baseViewName"),
-                        "modelQualifiedName": f"{self.tenant_id}/model/{model_id}",
-                        "sourceTableName": row.get("sourceTableName"),
-                        "sourceSchema": row.get("sourceSchema"),
-                        "sourceCatalog": row.get("sourceCatalog"),
-                        "joinedViewNames": row.get("joinedViewNames") or None,
-                        "dimensionNames": row.get("dimensionNames") or None,
-                        "measureNames": row.get("measureNames") or None,
-                        **self._base_custom_attributes(workflow_id, workflow_run_id),
-                    },
+                    "typeName": "OmniV01Topic",
+                    "attributes": attrs,
                     "relationshipAttributes": {
-                        "modelQualifiedName": self._rel_ref(
-                            "omni_model", f"{self.tenant_id}/model/{model_id}"
-                        ),
+                        "model": self._rel_ref("OmniV01Model", self._model_qn(model_id)),
                     },
                 }
             )
@@ -189,28 +224,34 @@ class OmniMetadataTransformer:
     def _folders(
         self,
         records: list[dict[str, Any]],
-        workflow_id: str,
-        workflow_run_id: str,
     ) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
         for row in records:
             folder_id = row.get("id")
             if not folder_id:
                 continue
+            qn = self._folder_qn(folder_id)
             owner = row.get("owner") or {}
+            attrs: dict[str, Any] = {
+                "qualifiedName": qn,
+                "name": row.get("name") or folder_id,
+                "connectorName": "omni",
+                "omniV01Id": folder_id,
+                "omniV01Path": row.get("path"),
+            }
+            scope = self._normalize_enum(row.get("scope"), _SCOPES)
+            if scope:
+                attrs["omniV01Scope"] = scope
+            owner_users = self._owner_users(
+                owner if owner else {"name": row.get("ownerName")}
+            )
+            if owner_users:
+                attrs["ownerUsers"] = owner_users
+
             entities.append(
                 {
-                    "typeName": "omni_folder",
-                    "attributes": {
-                        "qualifiedName": f"{self.tenant_id}/folder/{folder_id}",
-                        "name": row.get("name") or folder_id,
-                        "omniId": folder_id,
-                        "path": row.get("path"),
-                        "scope": row.get("scope"),
-                        "ownerId": owner.get("id"),
-                        "ownerName": owner.get("name"),
-                        **self._base_custom_attributes(workflow_id, workflow_run_id),
-                    },
+                    "typeName": "OmniV01Folder",
+                    "attributes": attrs,
                 }
             )
         return entities
@@ -218,85 +259,78 @@ class OmniMetadataTransformer:
     def _documents(
         self,
         records: list[dict[str, Any]],
-        workflow_id: str,
-        workflow_run_id: str,
     ) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
         for row in records:
             identifier = row.get("identifier")
             if not identifier:
                 continue
+
+            doc_type = "DASHBOARD" if row.get("hasDashboard") else "WORKBOOK"
+            qn = self._document_qn(identifier)
             owner = row.get("owner") or {}
             folder = row.get("folder") or {}
-            doc_type = "omni_dashboard" if row.get("hasDashboard") else "omni_workbook"
-            conn_id = row.get("connectionId")
-            folder_id = folder.get("id")
 
-            topic_qns = sorted({
-                f"{self.tenant_id}/model/{t['modelId']}/topic/{t['topicName']}"
-                for t in (row.get("tileTopics") or [])
-                if t.get("modelId") and t.get("topicName")
-            })
-
-            rel_attrs = {}
-            if conn_id:
-                rel_attrs["connectionQualifiedName"] = self._rel_ref(
-                    "omni_connection", f"{self.tenant_id}/connection/{conn_id}"
-                )
-            if folder_id:
-                rel_attrs["folderQualifiedName"] = self._rel_ref(
-                    "omni_folder", f"{self.tenant_id}/folder/{folder_id}"
-                )
-            entity = {
-                "typeName": doc_type,
-                "attributes": {
-                    "qualifiedName": f"{self.tenant_id}/document/{identifier}",
-                    "name": row.get("name") or identifier,
-                    "omniId": identifier,
-                    "scope": row.get("scope"),
-                    "url": row.get("url"),
-                    "updatedAt": row.get("updatedAt"),
-                    "sourceType": row.get("type"),
-                    "ownerId": owner.get("id"),
-                    "ownerName": owner.get("name"),
-                    "folderPath": folder.get("path"),
-                    "connectionQualifiedName": (
-                        f"{self.tenant_id}/connection/{conn_id}" if conn_id else None
-                    ),
-                    "folderQualifiedName": (
-                        f"{self.tenant_id}/folder/{folder_id}" if folder_id else None
-                    ),
-                    "topicQualifiedNames": topic_qns or None,
-                    **self._base_custom_attributes(workflow_id, workflow_run_id),
-                },
+            attrs: dict[str, Any] = {
+                "qualifiedName": qn,
+                "name": row.get("name") or identifier,
+                "connectorName": "omni",
+                "omniV01Id": identifier,
+                "omniV01DocumentType": doc_type,
+                "omniV01Url": row.get("url"),
+                "omniV01FolderPath": folder.get("path"),
+                "sourceURL": row.get("url"),
+                "sourceUpdatedAt": row.get("updatedAt"),
             }
-            if rel_attrs:
-                entity["relationshipAttributes"] = rel_attrs
-            entities.append(entity)
+            description = row.get("description")
+            if description:
+                attrs["description"] = description
+            scope = self._normalize_enum(row.get("scope"), _SCOPES)
+            if scope:
+                attrs["omniV01Scope"] = scope
+            owner_users = self._owner_users(
+                owner if owner else {"name": row.get("ownerName")}
+            )
+            if owner_users:
+                attrs["ownerUsers"] = owner_users
+
+            rel_attrs: dict[str, Any] = {
+                "connection": self._rel_ref("Connection", self.connection_qn),
+            }
+            folder_id = folder.get("id")
+            if folder_id:
+                rel_attrs["folder"] = self._rel_ref(
+                    "OmniV01Folder", self._folder_qn(folder_id)
+                )
+
+            entities.append(
+                {
+                    "typeName": "OmniV01Document",
+                    "attributes": attrs,
+                    "relationshipAttributes": rel_attrs,
+                }
+            )
         return entities
 
-    def _processes_topic_to_dashboard(
+    # ------------------------------------------------------------------ #
+    # Process entities (warehouse -> topic, topic -> document)
+    # ------------------------------------------------------------------ #
+
+    def _processes_topic_to_document(
         self,
         documents: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Emit Atlan Process entities for each (topic -> document) lineage edge.
+        """Emit Process entities for each (topic -> document) lineage edge.
 
-        Atlan renders a Process in the lineage graph when its `inputs` and
-        `outputs` reference assets that exist in the catalog. We emit one
-        Process per (topic, document) pair derived from the document's
-        `tileTopics` (already deduplicated upstream in the client).
-
-        Sync-tracking attributes (last_sync_run, etc.) are intentionally
-        omitted — those are registered on our custom typedefs only, not on
-        Atlan's built-in Process supertype.
+        Topic-to-document edges come from `tileTopics` (deduped upstream in
+        client._fetch_document_detail). One Process per unique (topic, doc).
         """
         entities: list[dict[str, Any]] = []
         for doc in documents:
             identifier = doc.get("identifier")
             if not identifier:
                 continue
-            doc_qn = f"{self.tenant_id}/document/{identifier}"
-            doc_type = "omni_dashboard" if doc.get("hasDashboard") else "omni_workbook"
+            doc_qn = self._document_qn(identifier)
             doc_label = doc.get("name") or identifier
             seen: set[tuple[str, str]] = set()
             for tile in doc.get("tileTopics") or []:
@@ -308,9 +342,9 @@ class OmniMetadataTransformer:
                 if key in seen:
                     continue
                 seen.add(key)
-                topic_qn = f"{self.tenant_id}/model/{model_id}/topic/{topic_name}"
+                topic_qn = self._topic_qn(model_id, topic_name)
                 process_qn = (
-                    f"{self.tenant_id}/process/topic/{model_id}/{topic_name}"
+                    f"{self.connection_qn}/process/topic/{model_id}/{topic_name}"
                     f"/document/{identifier}"
                 )
                 entities.append(
@@ -322,8 +356,8 @@ class OmniMetadataTransformer:
                             "connectorName": "omni",
                         },
                         "relationshipAttributes": {
-                            "inputs": [self._rel_ref("omni_topic", topic_qn)],
-                            "outputs": [self._rel_ref(doc_type, doc_qn)],
+                            "inputs": [self._rel_ref("OmniV01Topic", topic_qn)],
+                            "outputs": [self._rel_ref("OmniV01Document", doc_qn)],
                         },
                     }
                 )
@@ -335,19 +369,12 @@ class OmniMetadataTransformer:
         model_to_connection: dict[str, str],
         connection_to_database: dict[str, str],
     ) -> list[dict[str, Any]]:
-        """Emit Atlan Process entities for each (source-table(s) -> topic) edge.
+        """Emit Process entities for each (source-table(s) -> topic) edge.
 
-        Each topic gets at most one Process whose inputs are the source database
-        tables backing all of the topic's views (base + joined). The source-table
-        qualifiedName is built from the user-supplied `atlan_source_connection_map`
-        (Omni connection -> Atlan source-connection qualifiedName) plus each view's
-        catalog/schema/table_name. When a view has no catalog (single-database
-        connectors), the Omni connection's `database` is used as the catalog.
-
-        The Process is skipped if:
-        - no `atlan_source_connection_map` is configured
-        - the topic's model has no connection, or its connection isn't in the map
-        - none of the topic's views resolve to a complete table qualifiedName
+        One Process per topic whose backing views resolve to a complete
+        warehouse table QN via the operator-supplied
+        atlan_source_connection_map. Falls back to the Omni connection's
+        `database` when a view has no `catalog` (single-database connectors).
         """
         if not self.atlan_source_connection_map:
             return []
@@ -383,9 +410,9 @@ class OmniMetadataTransformer:
             if not input_refs:
                 continue
 
-            topic_qn = f"{self.tenant_id}/model/{model_id}/topic/{topic_name}"
+            topic_qn = self._topic_qn(model_id, topic_name)
             process_qn = (
-                f"{self.tenant_id}/process/source/topic/{model_id}/{topic_name}"
+                f"{self.connection_qn}/process/source/topic/{model_id}/{topic_name}"
             )
             topic_label = row.get("label") or topic_name
             entities.append(
@@ -398,7 +425,7 @@ class OmniMetadataTransformer:
                     },
                     "relationshipAttributes": {
                         "inputs": input_refs,
-                        "outputs": [self._rel_ref("omni_topic", topic_qn)],
+                        "outputs": [self._rel_ref("OmniV01Topic", topic_qn)],
                     },
                 }
             )

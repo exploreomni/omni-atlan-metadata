@@ -8,19 +8,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Helpers
 # ---------------------------------------------------------------------------
 
+DEFAULT_EPOCH = "1747156800000"
+
+
 def _make_base_args(overrides: dict | None = None) -> dict:
-    """Simulate what the SDK's get_workflow_args returns from the state store."""
+    """Simulate what the SDK's get_workflow_args returns from the state store.
+
+    `connection_epoch_ms` is required by the activity; injected by default so
+    individual tests don't need to set it unless they're exercising validation.
+    """
     base = {
         "workflow_id": "wf-123",
         "workflow_run_id": "run-456",
         "output_path": "./local/tmp/wf-123/run-456",
         "output_prefix": "./local/tmp/",
-        "payload": {},
+        "payload": {"connection_epoch_ms": DEFAULT_EPOCH},
         "metadata": {},
         "credentials": {},
     }
     if overrides:
+        # Merge payload overrides instead of clobbering so callers don't lose
+        # the default connection_epoch_ms.
+        payload_override = overrides.pop("payload", None)
         base.update(overrides)
+        if payload_override is not None:
+            base["payload"] = {**base["payload"], **payload_override}
     return base
 
 
@@ -45,12 +57,31 @@ async def _call_get_workflow_args(workflow_config: dict, base_args: dict) -> dic
 @pytest.mark.asyncio
 async def test_defaults_when_state_empty():
     result = await _call_get_workflow_args({}, _make_base_args())
-    assert result["metadata"]["tenant_id"] == "omni"
+    assert result["metadata"]["connection_epoch_ms"] == DEFAULT_EPOCH
     assert result["metadata"]["page_size"] == 50
     assert result["metadata"]["max_pages"] is None
     assert result["metadata"]["save_output_local"] is False
     assert result["credentials"]["verify_ssl"] is True
     assert result["credentials"]["timeout_seconds"] == 30
+
+
+@pytest.mark.asyncio
+async def test_missing_connection_epoch_ms_raises():
+    from temporalio.exceptions import ApplicationError
+
+    base = _make_base_args()
+    base["payload"].pop("connection_epoch_ms")
+    with pytest.raises(ApplicationError, match="connection_epoch_ms"):
+        await _call_get_workflow_args({}, base)
+
+
+@pytest.mark.asyncio
+async def test_non_numeric_connection_epoch_ms_raises():
+    from temporalio.exceptions import ApplicationError
+
+    base = _make_base_args({"payload": {"connection_epoch_ms": "not-a-number"}})
+    with pytest.raises(ApplicationError, match="connection_epoch_ms"):
+        await _call_get_workflow_args({}, base)
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +95,14 @@ async def test_reads_credentials_from_payload():
             "payload": {
                 "omni_base_url": "https://org.omniapp.co/api",
                 "omni_api_token": "tok-abc",
-                "tenant_id": "acme",
+                "connection_epoch_ms": "1700000000000",
             }
         }
     )
     result = await _call_get_workflow_args({}, base)
     assert result["credentials"]["omni_base_url"] == "https://org.omniapp.co/api"
     assert result["credentials"]["omni_api_token"] == "tok-abc"
-    assert result["metadata"]["tenant_id"] == "acme"
+    assert result["metadata"]["connection_epoch_ms"] == "1700000000000"
 
 
 @pytest.mark.asyncio

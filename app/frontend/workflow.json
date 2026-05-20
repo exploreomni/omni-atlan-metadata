@@ -1,7 +1,7 @@
 {
   "id": "omni_connector",
   "name": "Omni Metadata Connector",
-  "logo": "https://assets.atlan.com/assets/ph-cloud.svg",
+  "logo": "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHN2ZyBpZD0iTGF5ZXJfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB2aWV3Qm94PSIwIDAgMTM3LjM5IDE3OSI+CiAgPGRlZnM+CiAgICA8c3R5bGU+CiAgICAgIC5jbHMtMSB7CiAgICAgICAgZmlsbDogIzRkMTIyYzsKICAgICAgfQogICAgPC9zdHlsZT4KICA8L2RlZnM+CiAgPHBhdGggY2xhc3M9ImNscy0xIiBkPSJNNjguNjksMTM3Ljg2YzM5Ljk1LDAsNjguNjktMjkuNjksNjguNjktNjguOTNTMTA4LjY0LDAsNjguNjksMCwwLDI5LjY5LDAsNjguOTNzMjguNzUsNjguOTMsNjguNjksNjguOTNaTTY4LjY5LDI2LjA5YzI0LjczLDAsNDEuMjIsMTguMjQsNDEuMjIsNDIuODRzLTE2LjQ5LDQyLjg0LTQxLjIyLDQyLjg0LTQxLjIyLTE4LjQ1LTQxLjIyLTQyLjg0LDE2LjQ5LTQyLjg0LDQxLjIyLTQyLjg0WiIvPgogIDxwYXRoIGNsYXNzPSJjbHMtMSIgZD0iTTEyMi4xNywxNTMuNTVIMTUuMjJjLTcuNCwwLTEzLjEsNS4wOS0xMy4xLDEyLjcyczUuNzEsMTIuNzMsMTMuMSwxMi43M2gxMDYuOTVjNy40LDAsMTMuMS01LjA5LDEzLjEtMTIuNzNzLTUuNzEtMTIuNzItMTMuMS0xMi43MloiLz4KPC9zdmc+",
   "config": {
     "properties": {
       "omni_base_url": {
@@ -23,12 +23,13 @@
           "grid": 8
         }
       },
-      "tenant_id": {
+      "connection_epoch_ms": {
         "type": "string",
         "required": true,
         "ui": {
-          "label": "Tenant ID / Prefix",
-          "placeholder": "omni",
+          "label": "Atlan Connection Epoch (ms)",
+          "placeholder": "1747156800000",
+          "help": "13-digit creation timestamp of the Atlan-side Omni Connection. Used as the QN namespace under default/omni/.",
           "grid": 4
         }
       },
@@ -76,6 +77,16 @@
           "grid": 4
         }
       },
+      "rate_limit_rpm": {
+        "type": "integer",
+        "required": false,
+        "ui": {
+          "label": "API Rate Limit (req/min)",
+          "placeholder": "60",
+          "help": "Omni's default is 60 req/min. Set lower if you share the token with other jobs.",
+          "grid": 4
+        }
+      },
       "atlan_source_connection_map": {
         "type": "string",
         "required": false,
@@ -113,12 +124,13 @@
         "properties": [
           "omni_base_url",
           "omni_api_token",
-          "tenant_id",
+          "connection_epoch_ms",
           "page_size",
           "max_pages",
           "verify_ssl",
           "timeout_seconds",
           "max_concurrency",
+          "rate_limit_rpm",
           "atlan_source_connection_map"
         ]
       }

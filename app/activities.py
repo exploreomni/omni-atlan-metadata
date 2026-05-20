@@ -27,15 +27,38 @@ class ActivitiesClass(ActivitiesInterface):
     ) -> Dict[str, Any]:
         base_args = await super().get_workflow_args(workflow_config)
 
+        # The SDK lays out form fields differently depending on the caller:
+        # - Production marketplace UI nests under payload/metadata/credentials
+        # - The local playground flattens fields onto base_args itself
+        # Look in all four locations and use whichever populated first.
         payload = base_args.get("payload", {}) or {}
         metadata_in = base_args.get("metadata", {}) or {}
         credentials_in = base_args.get("credentials", {}) or {}
 
-        tenant_id = payload.get("tenant_id") or metadata_in.get("tenant_id") or "omni"
-        page_size_raw = payload.get("page_size") or metadata_in.get("page_size") or 50
-        max_pages_raw = payload.get("max_pages") or metadata_in.get("max_pages")
-        timeout_raw = payload.get("timeout_seconds") or metadata_in.get("timeout_seconds") or 30
-        max_concurrency_raw = payload.get("max_concurrency") or metadata_in.get("max_concurrency") or 10
+        def _form_value(key: str) -> Any:
+            for src in (payload, metadata_in, credentials_in, base_args):
+                if key in src and src[key] not in (None, ""):
+                    return src[key]
+            return None
+
+        connection_epoch_ms = str(_form_value("connection_epoch_ms") or "").strip()
+        if not connection_epoch_ms or not connection_epoch_ms.isdigit():
+            logger.error(
+                f"connection_epoch_ms validation failed. "
+                f"base_keys={sorted(base_args.keys())} "
+                f"received_value={_form_value('connection_epoch_ms')!r}"
+            )
+            raise ApplicationError(
+                "connection_epoch_ms is required and must be a numeric "
+                "millisecond epoch (13 digits, e.g. 1747156800000). It "
+                "identifies the Atlan-side Connection that anchors all "
+                "Omni asset qualifiedNames.",
+                non_retryable=True,
+            )
+        page_size_raw = _form_value("page_size") or 50
+        max_pages_raw = _form_value("max_pages")
+        timeout_raw = _form_value("timeout_seconds") or 30
+        max_concurrency_raw = _form_value("max_concurrency") or 10
 
         def _to_int(value: Any, default: int | None = None) -> int | None:
             if value in (None, "", "null"):
@@ -57,37 +80,35 @@ class ActivitiesClass(ActivitiesInterface):
             return {str(k): str(v) for k, v in value.items() if k and v}
 
         atlan_source_connection_map = _to_str_str_map(
-            payload.get("atlan_source_connection_map")
-            or metadata_in.get("atlan_source_connection_map")
+            _form_value("atlan_source_connection_map")
         )
+
+        save_output_raw = _form_value("save_output_local")
+        verify_ssl_raw = _form_value("verify_ssl")
+
+        # Local dev convenience: when the operator launched the app via
+        # OMNI_LOCAL_UI=1, force the local NDJSON dump on so dry-runs leave
+        # a file on disk the inspector can read. In production OMNI_LOCAL_UI
+        # is unset, so this has no effect.
+        if os.environ.get("OMNI_LOCAL_UI", "").lower() in ("1", "true", "yes"):
+            save_output_raw = True
 
         metadata: dict[str, Any] = {
             "page_size": _to_int(page_size_raw, 50),
             "max_pages": _to_int(max_pages_raw, None),
-            "tenant_id": tenant_id,
-            "output_file": payload.get("output_file") or metadata_in.get("output_file") or "omni_entities.ndjson",
-            "save_output_local": bool(
-                payload.get("save_output_local", metadata_in.get("save_output_local", False))
-            ),
+            "connection_epoch_ms": connection_epoch_ms,
+            "output_file": _form_value("output_file") or "omni_entities.ndjson",
+            "save_output_local": False if save_output_raw is None else bool(save_output_raw),
             "max_concurrency": _to_int(max_concurrency_raw, 10),
             "atlan_source_connection_map": atlan_source_connection_map,
         }
 
         credentials = {
-            "omni_base_url": (
-                payload.get("omni_base_url")
-                or credentials_in.get("omni_base_url")
-                or metadata_in.get("omni_base_url")
-            ),
-            "omni_api_token": (
-                payload.get("omni_api_token")
-                or credentials_in.get("omni_api_token")
-                or metadata_in.get("omni_api_token")
-            ),
-            "verify_ssl": bool(
-                payload.get("verify_ssl", credentials_in.get("verify_ssl", metadata_in.get("verify_ssl", True)))
-            ),
+            "omni_base_url": _form_value("omni_base_url"),
+            "omni_api_token": _form_value("omni_api_token"),
+            "verify_ssl": True if verify_ssl_raw is None else bool(verify_ssl_raw),
             "timeout_seconds": _to_int(timeout_raw, 30),
+            "rate_limit_rpm": _to_int(_form_value("rate_limit_rpm"), 60),
         }
 
         # output_path is set by the SDK's get_workflow_args; fall back to a local temp dir.
@@ -118,14 +139,10 @@ class ActivitiesClass(ActivitiesInterface):
             raise ApplicationError(str(exc), non_retryable=not exc.retryable) from exc
 
         transformer = OmniMetadataTransformer(
-            tenant_id=args["metadata"]["tenant_id"],
+            connection_epoch_ms=args["metadata"]["connection_epoch_ms"],
             atlan_source_connection_map=args["metadata"].get("atlan_source_connection_map", {}),
         )
-        entities = transformer.transform(
-            snapshot=snapshot,
-            workflow_id=args.get("workflow_id", "omni-extraction"),
-            workflow_run_id=args.get("workflow_run_id", "local-run"),
-        )
+        entities = transformer.transform(snapshot=snapshot)
 
         # Write entities via the SDK writer, which uploads to the Atlan object store
         # (when ENABLE_ATLAN_UPLOAD=true in production) or writes locally (in dev).

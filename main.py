@@ -1,6 +1,7 @@
 """Main entrypoint for the Omni connector application."""
 
 import asyncio
+import os
 
 from app.activities import ActivitiesClass
 from app.client import ClientClass
@@ -37,15 +38,25 @@ async def main():
         try:
             register_typedefs()
         except Exception:
-            logger.warning(
-                "Could not register Omni typedefs — Atlan may not be configured. "
-                "Set ATLAN_BASE_URL and ATLAN_API_KEY to enable typedef registration.",
+            # Surface as ERROR (not WARN): if typedefs are unregistered, the
+            # ingestion side cannot accept the entities this app emits.
+            logger.error(
+                "Failed to register Omni typedefs. Entities emitted by this run "
+                "will not be ingestible until typedefs exist on the target tenant. "
+                "Set ATLAN_BASE_URL and ATLAN_API_KEY for typedef registration.",
                 exc_info=True,
             )
 
+        # ui_enabled is False in production — the workflow form is served from
+        # marketplace-packages, not from this container, and the SDK's static
+        # mount would otherwise crash-loop on an empty frontend/static/ dir.
+        # For local development, set OMNI_LOCAL_UI=1 to mount the form on
+        # http://localhost:8000 so the dry-run flow is interactive.
+        ui_enabled = os.environ.get("OMNI_LOCAL_UI", "").lower() in ("1", "true", "yes")
         await application.start(
             workflow_class=WorkflowClass,
             has_configmap=True,
+            ui_enabled=ui_enabled,
         )
 
     except ApiError:
