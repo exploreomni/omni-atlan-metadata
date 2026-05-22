@@ -4,6 +4,30 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-05-22
+
+**Security fix.** v0.2.0 inadvertently shipped sensitive local files inside
+the Docker image because the `COPY . .` step in the Dockerfile did not honor
+`.gitignore`. Atlan partner review flagged:
+
+- `app/.env` containing a live Omni API token bound to `peter.omniapp.co`
+- `omni_entities.ndjson` — a 4.4 MB metadata snapshot of the same tenant
+- `.git/` history
+
+### Added
+
+- `.dockerignore` — authoritative exclusion list for the Docker build context:
+  `.env`/`.env.*` (except `.env.example`), `.git/`, `.venv/`, `local/`,
+  `components/`, `temporal.db*`, `omni_entities.ndjson`, `*.ndjson`, Python
+  caches, frontend playground assets, IDE files, `.github/`.
+
+### Fixed
+
+- v0.2.0 image leaked the Omni API token, a tenant metadata snapshot, and
+  `.git/`. v0.2.1 builds without any of these in the layer. The leaked token
+  was revoked on the Omni side; the v0.2.0 / `c95349` tags must not be
+  deployed.
+
 ## [0.2.0] - 2026-05-20
 
 Aligns the connector image with Atlan's v0 partner typedef reference, clears

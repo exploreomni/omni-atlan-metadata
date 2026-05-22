@@ -1,0 +1,69 @@
+# Docker build-context exclusions.
+#
+# Docker does NOT honor .gitignore — files only end up out of the build
+# context if they're listed here. Keep this file authoritative for the image
+# regardless of what the local working tree contains.
+
+# ----- Secrets (highest priority) -----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ----- Git -----
+.git/
+.gitignore
+.gitattributes
+
+# ----- Python build artifacts / caches -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+.tox/
+
+# ----- Virtual environments (huge; image installs its own under uv sync) -----
+.venv/
+venv/
+
+# ----- Local runtime / dev artifacts -----
+local/
+components/
+temporal.db*
+omni_entities.ndjson
+*.ndjson
+
+# ----- Frontend dev artifacts (playground SPA installs here locally) -----
+frontend/static/_nuxt/
+frontend/static/_fonts/
+frontend/static/200.html
+frontend/static/404.html
+frontend/static/favicon.ico
+frontend/static/mockServiceWorker.js
+frontend/static/robots.txt
+
+# ----- IDE / OS -----
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+.DS_Store
+
+# ----- CI / repo metadata not needed at runtime -----
+.github/
+.pre-commit-config.yaml
+
+# ----- Misc -----
+*.log
