@@ -1,19 +1,38 @@
-"""Tests for app/transformer.py"""
+"""Tests for app/transformer.py — OmniV01* typedef alignment."""
 
 import pytest
 
 from app.transformer import OmniMetadataTransformer
 
-WF_ID = "test-workflow"
-RUN_ID = "test-run"
+EPOCH = "1747156800000"
+CONN_QN = f"default/omni/{EPOCH}"
 
 SNAPSHOT = {
     "connections": [
         {"id": "conn1", "name": "Snowflake", "dialect": "snowflake", "database": "analytics"},
     ],
     "models": [
-        {"id": "mod1", "name": "Sales Model", "modelKind": "base", "connectionId": "conn1", "baseModelId": None, "updatedAt": "2024-01-01T00:00:00+00:00"},
-        {"id": "mod2", "name": "Derived", "modelKind": "derived", "connectionId": "conn1", "baseModelId": "mod1", "updatedAt": None},
+        {
+            "id": "mod1",
+            "name": "Sales Model",
+            "description": "All revenue topics",
+            "modelKind": "SHARED",
+            "connectionId": "conn1",
+            "baseModelId": None,
+            "updatedAt": "2024-01-01T00:00:00+00:00",
+            "scope": "ORGANIZATION",
+            "ownerName": "Alice Builder",
+        },
+        {
+            "id": "mod2",
+            "name": "Derived",
+            "modelKind": "WORKBOOK",
+            "connectionId": "conn1",
+            "baseModelId": "mod1",
+            "updatedAt": None,
+        },
+        # SCHEMA models are filtered out entirely.
+        {"id": "mod3", "name": "Raw", "modelKind": "SCHEMA", "connectionId": "conn1"},
     ],
     "topics": [
         {
@@ -21,388 +40,321 @@ SNAPSHOT = {
             "name": "orders",
             "label": "Orders",
             "baseViewName": "orders_view",
-            "sourceTableName": "orders",
-            "sourceSchema": "public",
-            "sourceCatalog": "analytics",
-            "joinedViewNames": ["customers_view", "products_view"],
-            "dimensionNames": ["orders_view.id", "orders_view.created_at"],
-            "measureNames": ["orders_view.total_revenue", "orders_view.count"],
             "viewSources": [
                 {"viewName": "orders_view", "tableName": "orders", "schema": "public", "catalog": "analytics"},
                 {"viewName": "customers_view", "tableName": "customers", "schema": "public", "catalog": "analytics"},
-                {"viewName": "products_view", "tableName": "products", "schema": "public", "catalog": None},  # falls back to conn.database
+                {"viewName": "products_view", "tableName": "products", "schema": "public", "catalog": None},
             ],
         },
         {"modelId": "mod1", "name": "customers", "label": None, "baseViewName": "customers_view"},
     ],
     "folders": [
-        {"id": "fold1", "name": "Marketing", "path": "/Marketing", "scope": "shared", "owner": {"id": "u1", "name": "Alice"}},
-        {"id": "fold2", "name": "Finance", "path": "/Finance", "scope": "personal", "owner": None},
+        {
+            "id": "fold1",
+            "name": "Marketing",
+            "path": "Acme/Marketing",
+            "scope": "ORGANIZATION",
+            "owner": {"id": "u1", "email": "alice@example.com", "name": "Alice"},
+        },
+        {"id": "fold2", "name": "Finance", "path": "Acme/Finance", "scope": "garbage-scope", "owner": None},
     ],
     "documents": [
         {
             "identifier": "doc1",
             "name": "Revenue Dashboard",
             "hasDashboard": True,
-            "scope": "shared",
+            "scope": "ORGANIZATION",
             "url": "https://app.omni.co/doc1",
             "updatedAt": "2024-06-01T00:00:00+00:00",
             "type": "WORKBOOK",
-            "connectionId": "conn1",
-            "owner": {"id": "u2", "name": "Bob"},
-            "folder": {"id": "fold1", "path": "/Marketing"},
+            "owner": {"id": "u2", "email": "bob@example.com", "name": "Bob"},
+            "folder": {"id": "fold1", "path": "Acme/Marketing"},
             "tileTopics": [
                 {"modelId": "mod1", "topicName": "orders"},
                 {"modelId": "mod1", "topicName": "customers"},
-                {"modelId": "mod1", "topicName": "orders"},  # duplicate — should be deduped
+                {"modelId": "mod1", "topicName": "orders"},  # duplicate -> deduped
             ],
         },
         {
             "identifier": "doc2",
             "name": "Data Workbook",
             "hasDashboard": False,
-            "scope": "personal",
             "url": None,
             "updatedAt": None,
             "type": "WORKBOOK",
-            "connectionId": None,
             "owner": None,
             "folder": None,
             "tileTopics": [],
         },
     ],
+    "document_model_ids": [],
 }
 
 
 def transform(
-    tenant_id: str = "omni",
     atlan_source_connection_map: dict[str, str] | None = None,
 ) -> list[dict]:
     t = OmniMetadataTransformer(
-        tenant_id=tenant_id,
+        connection_epoch_ms=EPOCH,
         atlan_source_connection_map=atlan_source_connection_map,
     )
-    return t.transform(SNAPSHOT, WF_ID, RUN_ID)
+    return t.transform(SNAPSHOT)
 
 
 # ---------------------------------------------------------------------------
-# Counts
+# Counts + type names
 # ---------------------------------------------------------------------------
 
-def test_total_entity_count():
-    entities = transform()
-    # 1 conn + 2 models + 2 topics + 2 folders + 1 dashboard + 1 workbook
-    # + 2 Process entities (doc1's two unique tile topics)
-    assert len(entities) == 11
-
-
-def test_entity_type_counts():
-    entities = transform()
-    by_type = {}
-    for e in entities:
+def test_type_name_counts():
+    by_type: dict[str, int] = {}
+    for e in transform():
         by_type[e["typeName"]] = by_type.get(e["typeName"], 0) + 1
-    assert by_type["omni_connection"] == 1
-    assert by_type["omni_model"] == 2
-    assert by_type["omni_topic"] == 2
-    assert by_type["omni_folder"] == 2
-    assert by_type["omni_dashboard"] == 1
-    assert by_type["omni_workbook"] == 1
-    assert by_type["Process"] == 2
+    # SCHEMA model is filtered; no omni_connection / omni_dashboard / omni_workbook.
+    assert by_type["OmniV01Model"] == 2
+    assert by_type["OmniV01Topic"] == 2
+    assert by_type["OmniV01Folder"] == 2
+    assert by_type["OmniV01Document"] == 2
+    assert by_type["Process"] == 2  # two unique (topic, doc) pairs on doc1
+    assert "omni_connection" not in by_type
+    assert "omni_dashboard" not in by_type
+    assert "omni_workbook" not in by_type
+
+
+def test_no_connection_entity_emitted():
+    """omni_connection retired; connector references built-in Connection via relationship edge."""
+    assert not any(e["typeName"] == "Connection" for e in transform())
 
 
 # ---------------------------------------------------------------------------
-# Connection
+# Constructor validation
 # ---------------------------------------------------------------------------
 
-def test_connection_qualified_name():
-    entities = transform()
-    conn = next(e for e in entities if e["typeName"] == "omni_connection")
-    assert conn["attributes"]["qualifiedName"] == "omni/connection/conn1"
+def test_constructor_rejects_empty_epoch():
+    with pytest.raises(ValueError):
+        OmniMetadataTransformer(connection_epoch_ms="")
 
 
-def test_connection_attributes():
-    entities = transform()
-    conn = next(e for e in entities if e["typeName"] == "omni_connection")
-    attrs = conn["attributes"]
-    assert attrs["name"] == "Snowflake"
-    assert attrs["dialect"] == "snowflake"
-    assert attrs["database"] == "analytics"
-
-
-def test_connection_no_relationship_attributes_key():
-    # Connections have no outgoing cross-references so no relationship attributes expected.
-    entities = transform()
-    conn = next(e for e in entities if e["typeName"] == "omni_connection")
-    assert "relationshipAttributes" not in conn
+def test_constructor_rejects_non_digit_epoch():
+    with pytest.raises(ValueError):
+        OmniMetadataTransformer(connection_epoch_ms="not-a-number")
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Qualified names use the default/omni/{epoch}/... pattern
 # ---------------------------------------------------------------------------
 
-def test_model_connection_ref_in_attributes():
-    entities = transform()
-    models = [e for e in entities if e["typeName"] == "omni_model"]
-    base_model = next(m for m in models if m["attributes"]["omniId"] == "mod1")
-    assert base_model["attributes"]["connectionQualifiedName"] == "omni/connection/conn1"
-    assert base_model["attributes"]["baseModelQualifiedName"] is None
+def test_model_qualified_name():
+    mod = next(e for e in transform() if e["typeName"] == "OmniV01Model" and e["attributes"]["omniV01Id"] == "mod1")
+    assert mod["attributes"]["qualifiedName"] == f"{CONN_QN}/model/mod1"
 
-
-def test_derived_model_base_model_ref():
-    entities = transform()
-    models = [e for e in entities if e["typeName"] == "omni_model"]
-    derived = next(m for m in models if m["attributes"]["omniId"] == "mod2")
-    assert derived["attributes"]["baseModelQualifiedName"] == "omni/model/mod1"
-
-
-# ---------------------------------------------------------------------------
-# Topics
-# ---------------------------------------------------------------------------
 
 def test_topic_qualified_name():
-    entities = transform()
-    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
-    assert orders["attributes"]["qualifiedName"] == "omni/model/mod1/topic/orders"
-
-
-def test_topic_uses_label_as_name():
-    entities = transform()
-    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
-    assert orders["attributes"]["name"] == "Orders"
-
-
-def test_topic_falls_back_to_name_when_no_label():
-    entities = transform()
-    customers = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "customers")
-    assert customers["attributes"]["name"] == "customers"
-
-
-def test_topic_model_ref_in_attributes():
-    entities = transform()
-    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
-    assert orders["attributes"]["modelQualifiedName"] == "omni/model/mod1"
-
-
-def test_topic_source_table_attrs():
-    entities = transform()
-    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
-    attrs = orders["attributes"]
-    assert attrs["sourceTableName"] == "orders"
-    assert attrs["sourceSchema"] == "public"
-    assert attrs["sourceCatalog"] == "analytics"
-
-
-def test_topic_joined_views_and_fields():
-    entities = transform()
-    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
-    attrs = orders["attributes"]
-    assert attrs["joinedViewNames"] == ["customers_view", "products_view"]
-    assert attrs["dimensionNames"] == ["orders_view.id", "orders_view.created_at"]
-    assert attrs["measureNames"] == ["orders_view.total_revenue", "orders_view.count"]
-
-
-def test_topic_without_enrichment_has_null_source_fields():
-    entities = transform()
-    customers = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "customers")
-    attrs = customers["attributes"]
-    assert attrs["sourceTableName"] is None
-    assert attrs["sourceSchema"] is None
-    assert attrs["sourceCatalog"] is None
-    assert attrs["joinedViewNames"] is None
-    assert attrs["dimensionNames"] is None
-    assert attrs["measureNames"] is None
-
-
-# ---------------------------------------------------------------------------
-# Folders
-# ---------------------------------------------------------------------------
-
-def test_folder_with_owner():
-    entities = transform()
-    mkt = next(e for e in entities if e["typeName"] == "omni_folder" and e["attributes"]["omniId"] == "fold1")
-    assert mkt["attributes"]["ownerId"] == "u1"
-    assert mkt["attributes"]["ownerName"] == "Alice"
-
-
-def test_folder_null_owner():
-    entities = transform()
-    fin = next(e for e in entities if e["typeName"] == "omni_folder" and e["attributes"]["omniId"] == "fold2")
-    assert fin["attributes"]["ownerId"] is None
-    assert fin["attributes"]["ownerName"] is None
-
-
-# ---------------------------------------------------------------------------
-# Documents
-# ---------------------------------------------------------------------------
-
-def test_dashboard_type():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc1")
-    assert doc["typeName"] == "omni_dashboard"
-
-
-def test_workbook_type():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc2")
-    assert doc["typeName"] == "omni_workbook"
-
-
-def test_dashboard_connection_ref():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc1")
-    assert doc["attributes"]["connectionQualifiedName"] == "omni/connection/conn1"
-    assert doc["attributes"]["folderQualifiedName"] == "omni/folder/fold1"
-
-
-def test_workbook_null_refs():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc2")
-    assert doc["attributes"]["connectionQualifiedName"] is None
-    assert doc["attributes"]["folderQualifiedName"] is None
-
-
-# ---------------------------------------------------------------------------
-# Relationship attributes
-# ---------------------------------------------------------------------------
-
-def test_model_connection_relationship_attr():
-    entities = transform()
-    models = [e for e in entities if e["typeName"] == "omni_model"]
-    base_model = next(m for m in models if m["attributes"]["omniId"] == "mod1")
-    rel = base_model["relationshipAttributes"]["connectionQualifiedName"]
-    assert rel["typeName"] == "omni_connection"
-    assert rel["uniqueAttributes"]["qualifiedName"] == "omni/connection/conn1"
-
-
-def test_model_without_connection_has_no_relationship_attributes():
-    t = OmniMetadataTransformer(tenant_id="omni")
-    result = t.transform(
-        {"connections": [], "models": [{"id": "m1", "name": "M", "modelKind": "base", "connectionId": None, "baseModelId": None}],
-         "topics": [], "folders": [], "documents": [], "document_model_ids": set()},
-        WF_ID, RUN_ID,
+    orders = next(
+        e for e in transform()
+        if e["typeName"] == "OmniV01Topic" and e["attributes"]["omniV01Id"] == "orders"
     )
-    model = next(e for e in result if e["typeName"] == "omni_model")
-    assert "relationshipAttributes" not in model
+    assert orders["attributes"]["qualifiedName"] == f"{CONN_QN}/model/mod1/topic/orders"
 
 
-def test_derived_model_base_model_relationship_attr():
-    entities = transform()
-    models = [e for e in entities if e["typeName"] == "omni_model"]
-    derived = next(m for m in models if m["attributes"]["omniId"] == "mod2")
-    rel = derived["relationshipAttributes"]["baseModelQualifiedName"]
-    assert rel["typeName"] == "omni_model"
-    assert rel["uniqueAttributes"]["qualifiedName"] == "omni/model/mod1"
+def test_folder_qualified_name():
+    f = next(e for e in transform() if e["typeName"] == "OmniV01Folder" and e["attributes"]["omniV01Id"] == "fold1")
+    assert f["attributes"]["qualifiedName"] == f"{CONN_QN}/folder/fold1"
 
 
-def test_topic_model_relationship_attr():
-    entities = transform()
-    orders = next(e for e in entities if e["typeName"] == "omni_topic" and e["attributes"]["omniName"] == "orders")
-    rel = orders["relationshipAttributes"]["modelQualifiedName"]
-    assert rel["typeName"] == "omni_model"
-    assert rel["uniqueAttributes"]["qualifiedName"] == "omni/model/mod1"
-
-
-def test_dashboard_relationship_attrs():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc1")
-    rel_attrs = doc["relationshipAttributes"]
-    assert rel_attrs["connectionQualifiedName"]["typeName"] == "omni_connection"
-    assert rel_attrs["connectionQualifiedName"]["uniqueAttributes"]["qualifiedName"] == "omni/connection/conn1"
-    assert rel_attrs["folderQualifiedName"]["typeName"] == "omni_folder"
-    assert rel_attrs["folderQualifiedName"]["uniqueAttributes"]["qualifiedName"] == "omni/folder/fold1"
-
-
-def test_workbook_no_refs_has_no_relationship_attributes():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc2")
-    assert "relationshipAttributes" not in doc
-
-
-def test_dashboard_topic_qualified_names_deduped():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc1")
-    qns = doc["attributes"]["topicQualifiedNames"]
-    assert sorted(qns) == [
-        "omni/model/mod1/topic/customers",
-        "omni/model/mod1/topic/orders",
-    ]
-
-
-def test_workbook_no_tile_topics_is_none():
-    entities = transform()
-    doc = next(e for e in entities if e.get("attributes", {}).get("omniId") == "doc2")
-    assert doc["attributes"]["topicQualifiedNames"] is None
+def test_document_qualified_name():
+    d = next(e for e in transform() if e["typeName"] == "OmniV01Document" and e["attributes"]["omniV01Id"] == "doc1")
+    assert d["attributes"]["qualifiedName"] == f"{CONN_QN}/document/doc1"
 
 
 # ---------------------------------------------------------------------------
-# Topic -> Dashboard lineage processes
+# Standard Asset.* fields + custom omniV01* attrs
 # ---------------------------------------------------------------------------
 
-def test_process_emitted_per_unique_topic_dashboard_pair():
-    entities = transform()
-    processes = [e for e in entities if e["typeName"] == "Process"]
-    assert len(processes) == 2
-    qns = {p["attributes"]["qualifiedName"] for p in processes}
-    assert qns == {
-        "omni/process/topic/mod1/orders/document/doc1",
-        "omni/process/topic/mod1/customers/document/doc1",
+def test_model_attributes_map_to_standard_asset_fields():
+    mod = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
+    attrs = mod["attributes"]
+    assert attrs["name"] == "Sales Model"
+    assert attrs["description"] == "All revenue topics"
+    assert attrs["connectorName"] == "omni"
+    assert attrs["sourceUpdatedAt"] == "2024-01-01T00:00:00+00:00"
+    assert attrs["omniV01ModelKind"] == "SHARED"
+    assert attrs["omniV01Scope"] == "ORGANIZATION"
+
+
+def test_document_uses_source_url_and_source_updated_at():
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
+    assert d["attributes"]["sourceURL"] == "https://app.omni.co/doc1"
+    assert d["attributes"]["sourceUpdatedAt"] == "2024-06-01T00:00:00+00:00"
+    assert d["attributes"]["omniV01Url"] == "https://app.omni.co/doc1"
+
+
+def test_dashboard_discriminator():
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
+    assert d["attributes"]["omniV01DocumentType"] == "DASHBOARD"
+
+
+def test_workbook_discriminator():
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
+    assert d["attributes"]["omniV01DocumentType"] == "WORKBOOK"
+
+
+def test_folder_path_and_owner():
+    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
+    assert f["attributes"]["omniV01Path"] == "Acme/Marketing"
+    assert f["attributes"]["ownerUsers"] == ["alice@example.com"]
+
+
+def test_topic_does_not_carry_source_table_attrs():
+    """Per typedef ref §5.3: warehouse lineage lives on Process, not on Topic."""
+    orders = next(
+        e for e in transform()
+        if e["typeName"] == "OmniV01Topic" and e["attributes"]["omniV01Id"] == "orders"
+    )
+    attrs = orders["attributes"]
+    assert "sourceTableName" not in attrs
+    assert "sourceSchema" not in attrs
+    assert "sourceCatalog" not in attrs
+
+
+def test_document_does_not_carry_topic_qualified_names():
+    """Per typedef ref §5.5: topic->document lineage lives on Process, not on Document."""
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
+    assert "topicQualifiedNames" not in d["attributes"]
+
+
+def test_legacy_custom_sync_attrs_not_emitted():
+    """Custom last_sync_* triple retired; Atlan handles sync tracking via standard Asset.*"""
+    for e in transform():
+        attrs = e["attributes"]
+        assert "last_sync_workflow_name" not in attrs
+        assert "last_sync_run" not in attrs
+        assert "connector_name" not in attrs
+
+
+# ---------------------------------------------------------------------------
+# Enum normalization
+# ---------------------------------------------------------------------------
+
+def test_invalid_model_kind_drops_entity():
+    snap = {
+        "connections": [],
+        "models": [{"id": "m1", "name": "M", "modelKind": "garbage", "connectionId": None}],
+        "topics": [],
+        "folders": [],
+        "documents": [],
+        "document_model_ids": [],
+    }
+    out = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
+    assert not any(e["typeName"] == "OmniV01Model" for e in out)
+
+
+def test_invalid_scope_dropped_silently():
+    """Invalid scopes are stripped from attrs; the rest of the entity is still emitted."""
+    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold2")
+    assert "omniV01Scope" not in f["attributes"]
+
+
+def test_scope_case_normalized():
+    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
+    assert f["attributes"]["omniV01Scope"] == "ORGANIZATION"
+
+
+# ---------------------------------------------------------------------------
+# Relationships (typed Atlas edges)
+# ---------------------------------------------------------------------------
+
+def test_model_has_connection_relationship():
+    mod = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
+    rel = mod["relationshipAttributes"]["connection"]
+    assert rel == {
+        "typeName": "Connection",
+        "uniqueAttributes": {"qualifiedName": CONN_QN},
     }
 
 
-def test_process_inputs_and_outputs():
-    entities = transform()
+def test_derived_model_has_base_model_relationship():
+    derived = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod2")
+    rel = derived["relationshipAttributes"]["baseModel"]
+    assert rel == {
+        "typeName": "OmniV01Model",
+        "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
+    }
+
+
+def test_base_model_has_no_baseModel_relationship():
+    base = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
+    assert "baseModel" not in base["relationshipAttributes"]
+
+
+def test_topic_has_model_relationship():
+    orders = next(
+        e for e in transform()
+        if e["typeName"] == "OmniV01Topic" and e["attributes"]["omniV01Id"] == "orders"
+    )
+    rel = orders["relationshipAttributes"]["model"]
+    assert rel == {
+        "typeName": "OmniV01Model",
+        "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
+    }
+
+
+def test_document_has_connection_and_folder_relationships():
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
+    rels = d["relationshipAttributes"]
+    assert rels["connection"]["uniqueAttributes"]["qualifiedName"] == CONN_QN
+    assert rels["folder"] == {
+        "typeName": "OmniV01Folder",
+        "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/folder/fold1"},
+    }
+
+
+def test_document_without_folder_still_has_connection_relationship():
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
+    rels = d["relationshipAttributes"]
+    assert rels["connection"]["uniqueAttributes"]["qualifiedName"] == CONN_QN
+    assert "folder" not in rels
+
+
+# ---------------------------------------------------------------------------
+# Topic -> Document Process lineage
+# ---------------------------------------------------------------------------
+
+def test_topic_document_process_deduped():
+    processes = [e for e in transform() if e["typeName"] == "Process"]
+    qns = {p["attributes"]["qualifiedName"] for p in processes}
+    assert f"{CONN_QN}/process/topic/mod1/orders/document/doc1" in qns
+    assert f"{CONN_QN}/process/topic/mod1/customers/document/doc1" in qns
+
+
+def test_topic_document_process_io_types():
     process = next(
-        e
-        for e in entities
+        e for e in transform()
         if e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"]
-        == "omni/process/topic/mod1/orders/document/doc1"
+        and e["attributes"]["qualifiedName"] == f"{CONN_QN}/process/topic/mod1/orders/document/doc1"
     )
     rel = process["relationshipAttributes"]
-    assert rel["inputs"] == [
-        {
-            "typeName": "omni_topic",
-            "uniqueAttributes": {"qualifiedName": "omni/model/mod1/topic/orders"},
-        }
-    ]
-    assert rel["outputs"] == [
-        {
-            "typeName": "omni_dashboard",
-            "uniqueAttributes": {"qualifiedName": "omni/document/doc1"},
-        }
-    ]
-
-
-def test_process_has_omni_connector_name_and_human_name():
-    entities = transform()
-    process = next(
-        e
-        for e in entities
-        if e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"]
-        == "omni/process/topic/mod1/orders/document/doc1"
-    )
-    assert process["attributes"]["connectorName"] == "omni"
-    assert process["attributes"]["name"] == "orders -> Revenue Dashboard"
+    assert rel["inputs"] == [{
+        "typeName": "OmniV01Topic",
+        "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1/topic/orders"},
+    }]
+    assert rel["outputs"] == [{
+        "typeName": "OmniV01Document",
+        "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/document/doc1"},
+    }]
 
 
 def test_workbook_with_no_tile_topics_emits_no_process():
-    entities = transform()
     processes = [
-        e
-        for e in entities
+        e for e in transform()
         if e["typeName"] == "Process"
-        and e["relationshipAttributes"]["outputs"][0]["uniqueAttributes"][
-            "qualifiedName"
-        ]
-        == "omni/document/doc2"
+        and e["relationshipAttributes"]["outputs"][0]["uniqueAttributes"]["qualifiedName"]
+        == f"{CONN_QN}/document/doc2"
     ]
     assert processes == []
 
 
-def test_workbook_process_uses_workbook_output_type():
-    """If a workbook (not dashboard) had tile topics, its Process outputs would
-    reference omni_workbook, not omni_dashboard."""
+def test_workbook_process_outputs_document_typename():
+    """Both DASHBOARD and WORKBOOK collapsed to OmniV01Document — Process I/O typeName is uniform."""
     snapshot = dict(SNAPSHOT)
     snapshot["documents"] = [
         {
@@ -412,185 +364,103 @@ def test_workbook_process_uses_workbook_output_type():
             "tileTopics": [{"modelId": "mod1", "topicName": "orders"}],
         }
     ]
-    t = OmniMetadataTransformer(tenant_id="omni")
-    result = t.transform(snapshot, WF_ID, RUN_ID)
+    t = OmniMetadataTransformer(connection_epoch_ms=EPOCH)
+    result = t.transform(snapshot)
     process = next(e for e in result if e["typeName"] == "Process")
-    assert (
-        process["relationshipAttributes"]["outputs"][0]["typeName"] == "omni_workbook"
-    )
+    assert process["relationshipAttributes"]["outputs"][0]["typeName"] == "OmniV01Document"
 
 
 # ---------------------------------------------------------------------------
-# Sync attributes
-# ---------------------------------------------------------------------------
-
-def test_sync_attributes_present_on_all_omni_entities():
-    """Sync attrs are registered on our custom typedefs only — not on built-in Process."""
-    entities = transform()
-    for e in entities:
-        if e["typeName"] == "Process":
-            continue
-        attrs = e["attributes"]
-        assert attrs["connector_name"] == "omni", f"Missing connector_name on {e['typeName']}"
-        assert attrs["last_sync_workflow_name"] == WF_ID
-        assert attrs["last_sync_run"] == RUN_ID
-
-
-def test_process_entities_have_no_custom_sync_attrs():
-    """Process is Atlan's built-in supertype; emitting unregistered attrs risks rejection."""
-    entities = transform()
-    for e in entities:
-        if e["typeName"] != "Process":
-            continue
-        attrs = e["attributes"]
-        assert "connector_name" not in attrs  # snake_case (custom) — should NOT be present
-        assert "last_sync_run" not in attrs
-        assert "last_sync_workflow_name" not in attrs
-        assert attrs["connectorName"] == "omni"  # camelCase (standard Atlas) — IS present
-
-
-# ---------------------------------------------------------------------------
-# Custom tenant_id
-# ---------------------------------------------------------------------------
-
-def test_custom_tenant_id():
-    t = OmniMetadataTransformer(tenant_id="acme")
-    entities = t.transform(SNAPSHOT, WF_ID, RUN_ID)
-    conn = next(e for e in entities if e["typeName"] == "omni_connection")
-    assert conn["attributes"]["qualifiedName"].startswith("acme/")
-
-
-# ---------------------------------------------------------------------------
-# Missing required fields → entity skipped
-# ---------------------------------------------------------------------------
-
-def test_connection_without_id_skipped():
-    t = OmniMetadataTransformer(tenant_id="omni")
-    result = t.transform({"connections": [{"name": "no-id"}], "models": [], "topics": [], "folders": [], "documents": []}, WF_ID, RUN_ID)
-    assert not any(e["typeName"] == "omni_connection" for e in result)
-
-
-def test_document_without_identifier_skipped():
-    t = OmniMetadataTransformer(tenant_id="omni")
-    result = t.transform({"connections": [], "models": [], "topics": [], "folders": [], "documents": [{"name": "no-id"}]}, WF_ID, RUN_ID)
-    assert not any(e["typeName"] in ("omni_dashboard", "omni_workbook") for e in result)
-
-
-# ---------------------------------------------------------------------------
-# Source Table -> Topic lineage processes
+# Source-Table -> Topic Process lineage
 # ---------------------------------------------------------------------------
 
 SOURCE_MAP = {"conn1": "default/snowflake/1700000000"}
 
 
 def test_no_source_processes_when_map_missing():
-    entities = transform()  # no map configured
     assert not any(
         e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"].startswith("omni/process/source/")
-        for e in entities
+        and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")
+        for e in transform()
     )
 
 
 def test_source_to_topic_process_emitted():
     entities = transform(atlan_source_connection_map=SOURCE_MAP)
     sources = [
-        e
-        for e in entities
+        e for e in entities
         if e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"].startswith("omni/process/source/")
+        and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")
     ]
     assert len(sources) == 1
-    process = sources[0]
-    assert (
-        process["attributes"]["qualifiedName"]
-        == "omni/process/source/topic/mod1/orders"
-    )
-    assert process["attributes"]["name"] == "sources -> Orders"
-    assert process["attributes"]["connectorName"] == "omni"
+    p = sources[0]
+    assert p["attributes"]["qualifiedName"] == f"{CONN_QN}/process/source/topic/mod1/orders"
+    assert p["attributes"]["connectorName"] == "omni"
+    assert p["attributes"]["name"] == "sources -> Orders"
 
 
-def test_source_process_inputs_use_atlan_qn_format():
+def test_source_process_inputs_use_table_typename():
     entities = transform(atlan_source_connection_map=SOURCE_MAP)
-    process = next(
-        e
-        for e in entities
+    p = next(
+        e for e in entities
         if e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"] == "omni/process/source/topic/mod1/orders"
+        and e["attributes"]["qualifiedName"] == f"{CONN_QN}/process/source/topic/mod1/orders"
     )
-    inputs = process["relationshipAttributes"]["inputs"]
+    inputs = p["relationshipAttributes"]["inputs"]
     assert all(i["typeName"] == "Table" for i in inputs)
     qns = {i["uniqueAttributes"]["qualifiedName"] for i in inputs}
     assert qns == {
         "default/snowflake/1700000000/analytics/public/orders",
         "default/snowflake/1700000000/analytics/public/customers",
-        # products_view has catalog=None, falls back to conn1.database = "analytics"
+        # products_view's catalog is None → falls back to conn1.database = "analytics".
         "default/snowflake/1700000000/analytics/public/products",
     }
 
 
-def test_source_process_output_is_topic():
+def test_source_process_output_is_omni_v01_topic():
     entities = transform(atlan_source_connection_map=SOURCE_MAP)
-    process = next(
-        e
-        for e in entities
+    p = next(
+        e for e in entities
         if e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"] == "omni/process/source/topic/mod1/orders"
+        and e["attributes"]["qualifiedName"] == f"{CONN_QN}/process/source/topic/mod1/orders"
     )
-    outputs = process["relationshipAttributes"]["outputs"]
-    assert outputs == [
-        {
-            "typeName": "omni_topic",
-            "uniqueAttributes": {"qualifiedName": "omni/model/mod1/topic/orders"},
-        }
-    ]
+    assert p["relationshipAttributes"]["outputs"] == [{
+        "typeName": "OmniV01Topic",
+        "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1/topic/orders"},
+    }]
 
 
 def test_source_process_skipped_when_connection_not_in_map():
-    # Map points to a different Omni connection, so 'orders' topic gets no source process.
     entities = transform(atlan_source_connection_map={"some-other-conn": "default/redshift/x"})
     assert not any(
         e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"].startswith("omni/process/source/")
-        for e in entities
-    )
-
-
-def test_source_process_skipped_when_topic_has_no_view_sources():
-    # 'customers' topic has no viewSources in the SNAPSHOT.
-    entities = transform(atlan_source_connection_map=SOURCE_MAP)
-    assert not any(
-        e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"]
-        == "omni/process/source/topic/mod1/customers"
+        and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")
         for e in entities
     )
 
 
 def test_source_process_skipped_when_view_missing_schema_or_catalog():
-    """A view with no schema and no fallback catalog produces no input ref."""
-    snapshot = {
+    snap = {
         "connections": [{"id": "c1", "name": "C", "database": None}],
-        "models": [{"id": "m1", "name": "M", "modelKind": "base", "connectionId": "c1"}],
-        "topics": [
-            {
-                "modelId": "m1",
-                "name": "t1",
-                "label": "T1",
-                "baseViewName": "v1",
-                "viewSources": [{"viewName": "v1", "tableName": "t", "schema": None, "catalog": None}],
-            }
-        ],
+        "models": [{"id": "m1", "name": "M", "modelKind": "SHARED", "connectionId": "c1"}],
+        "topics": [{
+            "modelId": "m1",
+            "name": "t1",
+            "label": "T1",
+            "baseViewName": "v1",
+            "viewSources": [{"viewName": "v1", "tableName": "t", "schema": None, "catalog": None}],
+        }],
         "folders": [],
         "documents": [],
+        "document_model_ids": [],
     }
     t = OmniMetadataTransformer(
-        tenant_id="omni",
+        connection_epoch_ms=EPOCH,
         atlan_source_connection_map={"c1": "default/postgres/1"},
     )
-    result = t.transform(snapshot, WF_ID, RUN_ID)
+    result = t.transform(snap)
     assert not any(
         e["typeName"] == "Process"
-        and e["attributes"]["qualifiedName"].startswith("omni/process/source/")
+        and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")
         for e in result
     )

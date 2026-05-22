@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 import random
+import threading
 import time
 from typing import Any
 
@@ -12,6 +13,33 @@ import yaml
 from application_sdk.observability.logger_adaptor import get_logger
 
 logger = get_logger(__name__)
+
+# Omni's documented API rate limit. Each request gates through a token bucket
+# so concurrent threads collectively respect the cap.
+OMNI_DEFAULT_RPM = 60
+
+
+class _RateLimiter:
+    """Thread-safe minimum-interval gate. With rpm=60 calls are spaced ≥1s apart."""
+
+    def __init__(self, rpm: int):
+        self.min_interval = 60.0 / rpm if rpm and rpm > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def acquire(self) -> None:
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if now >= self._next_allowed:
+                self._next_allowed = now + self.min_interval
+                wait = 0.0
+            else:
+                wait = self._next_allowed - now
+                self._next_allowed += self.min_interval
+        if wait > 0:
+            time.sleep(wait)
 
 
 def _parse_dt(value: str | None) -> str | None:
@@ -54,9 +82,14 @@ class NonRetryableOmniApiError(OmniApiError):
 
 
 class ClientClass:
-    def __init__(self, credentials: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        credentials: dict[str, Any] | None = None,
+        rpm: int = OMNI_DEFAULT_RPM,
+    ):
         self._credentials: OmniCredentials | None = None
         self._http_client: httpx.Client | None = None
+        self._rate_limiter = _RateLimiter(rpm)
         if credentials:
             self.load_credentials(credentials)
 
@@ -73,6 +106,11 @@ class ClientClass:
 
         verify_ssl = bool(credentials.get("verify_ssl", True))
         timeout_seconds = int(credentials.get("timeout_seconds", 30))
+
+        # Reconfigure the rate limiter if the operator passed a custom rpm.
+        rpm_raw = credentials.get("rate_limit_rpm")
+        if rpm_raw not in (None, "", 0):
+            self._rate_limiter = _RateLimiter(int(rpm_raw))
         self._credentials = OmniCredentials(
             base_url=base_url,
             api_token=token,
@@ -106,6 +144,7 @@ class ClientClass:
         max_server_error_retries = 2
 
         for attempt in range(max_rate_limit_retries + 1):
+            self._rate_limiter.acquire()
             try:
                 response = self._client().get(path, params=params or {})
             except httpx.HTTPError as exc:
@@ -131,13 +170,19 @@ class ClientClass:
 
             if status == 429:
                 if attempt < max_rate_limit_retries:
-                    delay = (2**attempt) + random.uniform(0.0, 0.5)
+                    # Honor Retry-After if Omni sends it; else fall back to
+                    # jittered exponential backoff.
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        delay = float(retry_after) if retry_after else (
+                            (2**attempt) + random.uniform(0.0, 0.5)
+                        )
+                    except ValueError:
+                        delay = (2**attempt) + random.uniform(0.0, 0.5)
                     logger.warning(
-                        "Omni rate limit hit for %s. Retrying in %.2fs (attempt %d/%d).",
-                        path,
-                        delay,
-                        attempt + 1,
-                        max_rate_limit_retries,
+                        f"Omni rate limit hit for {path}. Retrying in {delay:.2f}s "
+                        f"(attempt {attempt + 1}/{max_rate_limit_retries}, "
+                        f"retry_after={retry_after!r})."
                     )
                     time.sleep(delay)
                     continue
@@ -383,29 +428,68 @@ class ClientClass:
         max_concurrency: int = 10,
     ) -> dict[str, Any]:
         connections = self.list_connections()
+        logger.info(f"fetch_snapshot: {len(connections)} connections")
+
         models = self._collect_paginated(self.list_models, page_size, max_pages)
+        logger.info(f"fetch_snapshot: {len(models)} models listed")
+
         folders = self._collect_paginated(self.list_folders, page_size, max_pages)
+        logger.info(f"fetch_snapshot: {len(folders)} folders listed")
+
         documents = self._collect_paginated(self.list_documents, page_size, max_pages)
+        logger.info(f"fetch_snapshot: {len(documents)} documents listed")
 
         # Fetch model YAMLs and document details concurrently in a shared pool.
-        # Both batches are submitted together so they overlap in flight.
+        # Both batches share workers; `as_completed` drives progress logging so
+        # operators can see how far along long-running tenants are.
         topics: list[dict[str, Any]] = []
-        document_model_ids: set[str] = set()
+        _seen_model_ids: set[str] = set()
+        document_model_ids: list[str] = []
         with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-            model_futures = [executor.submit(self._fetch_topics_for_model, m) for m in models]
-            doc_futures = [executor.submit(self._fetch_document_detail, d) for d in documents]
-            for future in model_futures:
-                topics.extend(future.result())
-            for doc, future in zip(documents, doc_futures):
-                detail = future.result()
-                if detail.get("modelId"):
-                    document_model_ids.add(detail["modelId"])
-                doc.update(detail)
+            model_futures = {
+                executor.submit(self._fetch_topics_for_model, m): m for m in models
+            }
+            doc_futures = {
+                executor.submit(self._fetch_document_detail, d): d for d in documents
+            }
+            total_models = len(model_futures)
+            total_docs = len(doc_futures)
+            done_models = 0
+            done_docs = 0
+
+            for future in as_completed({**model_futures, **doc_futures}):
+                if future in model_futures:
+                    topics.extend(future.result())
+                    done_models += 1
+                    if done_models % 5 == 0 or done_models == total_models:
+                        logger.info(
+                            f"fetch_snapshot progress: models {done_models}/{total_models}, "
+                            f"docs {done_docs}/{total_docs}, topics_so_far={len(topics)}"
+                        )
+                else:
+                    doc = doc_futures[future]
+                    detail = future.result()
+                    model_id = detail.get("modelId")
+                    if model_id and model_id not in _seen_model_ids:
+                        _seen_model_ids.add(model_id)
+                        document_model_ids.append(model_id)
+                    doc.update(detail)
+                    done_docs += 1
+                    if done_docs % 10 == 0 or done_docs == total_docs:
+                        logger.info(
+                            f"fetch_snapshot progress: models {done_models}/{total_models}, "
+                            f"docs {done_docs}/{total_docs}, topics_so_far={len(topics)}"
+                        )
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))
         for doc in documents:
             doc["updatedAt"] = _parse_dt(doc.get("updatedAt"))
+
+        logger.info(
+            f"fetch_snapshot done: connections={len(connections)} models={len(models)} "
+            f"folders={len(folders)} documents={len(documents)} topics={len(topics)}"
+        )
 
         return {
             "connections": connections,

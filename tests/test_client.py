@@ -14,7 +14,8 @@ CREDS = {
 
 
 def make_client() -> ClientClass:
-    return ClientClass(credentials=CREDS)
+    # rpm=0 disables the rate limiter so tests don't pay the 1s/request floor.
+    return ClientClass(credentials=CREDS, rpm=0)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +280,7 @@ def test_fetch_snapshot_resolves_document_model_ids_concurrently():
     )
 
     snapshot = make_client().fetch_snapshot()
-    assert snapshot["document_model_ids"] == {"mod1", "mod2"}
+    assert sorted(snapshot["document_model_ids"]) == ["mod1", "mod2"]
 
 
 @respx.mock
@@ -311,7 +312,7 @@ def test_fetch_snapshot_document_detail_failure_skips_but_continues():
     )
 
     snapshot = make_client().fetch_snapshot()
-    assert snapshot["document_model_ids"] == {"mod2"}
+    assert snapshot["document_model_ids"] == ["mod2"]
 
 
 @respx.mock

@@ -37,7 +37,7 @@ class WorkflowClass(WorkflowInterface):
             activities_instance.extract_and_transform_metadata,
             workflow_args,
             retry_policy=extract_retry_policy,
-            start_to_close_timeout=timedelta(minutes=20),
+            start_to_close_timeout=timedelta(hours=8),
         )
         workflow.logger.info("Omni extraction completed: %s", extraction_result)
 

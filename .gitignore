@@ -11,5 +11,13 @@ local/
 components/
 temporal.db*
 omni_entities.ndjson
+# Atlan app-playground installs its built SPA into frontend/static/ for
+# local-dev. Treat the whole dir as ignored except the placeholder
+# index.html (which the image ships).
 frontend/static/_nuxt/
 frontend/static/_fonts/
+frontend/static/200.html
+frontend/static/404.html
+frontend/static/favicon.ico
+frontend/static/mockServiceWorker.js
+frontend/static/robots.txt
