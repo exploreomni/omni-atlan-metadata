@@ -15,9 +15,11 @@ class HandlerClass(HandlerInterface):
         self.client = client or ClientClass()
 
     async def load(self, *args: Any, **kwargs: Any) -> None:
+        # Server path: args[0] = body.model_dump() = {"credentials": {...}, "metadata": {...}}
+        # Activities path: kwargs = {"credentials": {...}, ...}
         credentials = kwargs.get("credentials") or {}
         if args and isinstance(args[0], dict):
-            credentials = args[0]
+            credentials = args[0].get("credentials") or args[0]
         self.client.load_credentials(credentials)
 
     async def test_auth(self, *args: Any, **kwargs: Any) -> bool:

@@ -4,6 +4,25 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-05-31
+
+**Auth fix.** v0.2.1's `/workflows/v1/auth` route raised `ValueError: Both
+omni_base_url and omni_api_token are required.` on every credential load.
+The Atlan SDK wraps the auth body as `{"credentials": {...}, "metadata":
+{...}}` before calling `handler.load(body.model_dump())`, but `load()`
+passed the outer wrapper straight to `client.load_credentials`, which
+looks for `omni_base_url` at the top level — so it never found it.
+Reproduced on `marketplace-partner.atlan.com` (PART-1112) across four
+identical-fingerprint failures from pod `omni-7874b49895-v65xk`.
+
+### Fixed
+
+- `app/handler.py::HandlerClass.load` now unwraps the `credentials` key
+  out of the wrapped body before forwarding to the client, mirroring the
+  same logic already used in `preflight_check`. Falls back to the raw
+  `args[0]` so the activities path (which passes a flat dict) keeps
+  working.
+
 ## [0.2.1] - 2026-05-22
 
 **Security fix.** v0.2.0 inadvertently shipped sensitive local files inside
