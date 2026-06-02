@@ -37,6 +37,27 @@ def test_load_credentials_requires_protocol():
         ClientClass(credentials={"omni_base_url": "x.com/api", "omni_api_token": "t"})
 
 
+def test_load_credentials_accepts_wire_shape():
+    # Atlan UI → Heracles sends {"host": ..., "password": ..., "authType": "apikey"}.
+    # ClientClass must accept these as aliases for omni_base_url / omni_api_token.
+    client = ClientClass(
+        credentials={
+            "host": "https://test.omniapp.co/api",
+            "password": "tok-wire",
+            "authType": "apikey",
+        },
+        rpm=0,
+    )
+    assert client._credentials is not None
+    assert client._credentials.base_url == "https://test.omniapp.co/api"
+    assert client._credentials.api_token == "tok-wire"
+
+
+def test_load_credentials_wire_shape_protocol_check():
+    with pytest.raises(ValueError, match="protocol"):
+        ClientClass(credentials={"host": "x.com/api", "password": "t"})
+
+
 # ---------------------------------------------------------------------------
 # list_connections
 # ---------------------------------------------------------------------------

@@ -4,6 +4,31 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-06-02
+
+**Auth fix, round 2.** v0.2.2 unwrapped the SDK's wrapped auth body but
+`client.load_credentials` still only recognized the semantic key names
+`omni_base_url` / `omni_api_token`. The Atlan UI sends wire-shape keys
+`host` / `password` / `authType` through Heracles to
+`POST /workflows/v1/auth`, so v0.2.2 raised `ValueError` again — surfaced
+as Heracles' generic "App service returned an internal error" 400 in the
+Test Authentication form on `marketplace-partner.atlan.com`. Same
+PART-1112 ticket.
+
+### Fixed
+
+- `app/client.py::ClientClass.load_credentials` now accepts both
+  credential shapes: wire (`host`, `password`, `authType`) and semantic
+  (`omni_base_url`, `omni_api_token`). Wire keys are read as aliases for
+  the semantic keys; `authType` is ignored (only API-key auth is
+  supported). The protocol check applies to whichever base URL is
+  provided.
+
+### Added
+
+- Tests covering the wire-shape path and the protocol check against the
+  wire-shape base URL.
+
 ## [0.2.2] - 2026-05-31
 
 **Auth fix.** v0.2.1's `/workflows/v1/auth` route raised `ValueError: Both

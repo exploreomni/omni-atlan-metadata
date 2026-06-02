@@ -94,10 +94,24 @@ class ClientClass:
             self.load_credentials(credentials)
 
     def load_credentials(self, credentials: dict[str, Any]) -> None:
-        base_url = str(credentials.get("omni_base_url", "")).strip().rstrip("/")
-        token = str(credentials.get("omni_api_token", "")).strip()
+        # Accept both credential shapes:
+        # - Wire shape (Atlan UI → Heracles → /workflows/v1/auth): host, password, authType
+        # - Semantic shape (this app's own UI form, activities path): omni_base_url, omni_api_token
+        base_url = str(
+            credentials.get("omni_base_url")
+            or credentials.get("host")
+            or ""
+        ).strip().rstrip("/")
+        token = str(
+            credentials.get("omni_api_token")
+            or credentials.get("password")
+            or ""
+        ).strip()
         if not base_url or not token:
-            raise ValueError("Both omni_base_url and omni_api_token are required.")
+            raise ValueError(
+                "Credentials must include a base URL (omni_base_url or host) "
+                "and an API token (omni_api_token or password)."
+            )
         if not (base_url.startswith("https://") or base_url.startswith("http://")):
             raise ValueError(
                 "omni_base_url must include protocol, for example "
