@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 workflow.logger = logger
 
 
-@workflow.defn
+@workflow.defn(name="OmniMetadataExtractionWorkflow")
 class WorkflowClass(WorkflowInterface):
     @workflow.run
     async def run(self, workflow_config: Dict[str, Any]) -> None:

@@ -4,6 +4,25 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-06-04
+
+**Workflow registration fix.** v0.2.3 resolved Test Authentication on
+`marketplace-partner.atlan.com` but the first end-to-end workflow run
+sat idle: Atlan's launcher dispatches workflows by the wire-level type
+name `OmniMetadataExtractionWorkflow` (mirroring the SDK's
+`BaseSQLMetadataExtractionWorkflow` convention), and our class was
+registered under its Python symbol `WorkflowClass`. The Temporal worker
+reported class-not-found and never picked up the run. Latent in every
+prior image — the synchronous `/auth` route doesn't go through the
+workflow registry, so Test Authentication never exercised it.
+
+### Fixed
+
+- `app/workflow.py:15` — override the registered name on `@workflow.defn`
+  to `OmniMetadataExtractionWorkflow`. The Python class symbol
+  `WorkflowClass` is unchanged so `main.py` imports and other internal
+  references stay intact.
+
 ## [0.2.3] - 2026-06-02
 
 **Auth fix, round 2.** v0.2.2 unwrapped the SDK's wrapped auth body but
