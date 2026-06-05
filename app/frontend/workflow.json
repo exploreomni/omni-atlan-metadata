@@ -25,11 +25,11 @@
       },
       "connection_epoch_ms": {
         "type": "string",
-        "required": true,
+        "required": false,
         "ui": {
-          "label": "Atlan Connection Epoch (ms)",
+          "label": "Atlan Connection Epoch (ms, optional)",
           "placeholder": "1747156800000",
-          "help": "13-digit creation timestamp of the Atlan-side Omni Connection. Used as the QN namespace under default/omni/.",
+          "help": "13-digit creation timestamp of the Atlan-side Omni Connection. In production this is auto-derived from the Connection's qualifiedName; this field only applies to local playground runs.",
           "grid": 4
         }
       },

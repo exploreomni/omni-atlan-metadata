@@ -85,6 +85,61 @@ async def test_non_numeric_connection_epoch_ms_raises():
 
 
 # ---------------------------------------------------------------------------
+# Connection-blob derivation (production marketplace path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_connection_epoch_derived_from_connection_qn():
+    # Marketplace UI doesn't collect connection_epoch_ms — the SDK hands the
+    # resolved Connection via base_args["connection"]. Activity must derive
+    # the epoch from its qualifiedName.
+    base = _make_base_args()
+    base["payload"].pop("connection_epoch_ms")
+    base["connection"] = {
+        "attributes": {"qualifiedName": "default/omni/1733000000000"}
+    }
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1733000000000"
+
+
+@pytest.mark.asyncio
+async def test_connection_qn_wins_over_form_field():
+    # If both sources are present (operator left a stale form value), the
+    # Connection's qualifiedName is authoritative.
+    base = _make_base_args({"payload": {"connection_epoch_ms": "9999999999999"}})
+    base["connection"] = {
+        "attributes": {"qualifiedName": "default/omni/1733000000000"}
+    }
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1733000000000"
+
+
+@pytest.mark.asyncio
+async def test_malformed_connection_qn_falls_back_to_form_field():
+    # If the Connection blob has a junk QN (missing segments), fall back to
+    # the form-field path so local playground keeps working.
+    base = _make_base_args({"payload": {"connection_epoch_ms": "1700000000000"}})
+    base["connection"] = {"attributes": {"qualifiedName": "junk"}}
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1700000000000"
+
+
+@pytest.mark.asyncio
+async def test_connection_qn_with_extra_segments_still_works():
+    # Asset QNs like default/omni/<epoch>/model/<id> share the prefix —
+    # split("/")[2] still resolves the epoch.
+    base = _make_base_args()
+    base["payload"].pop("connection_epoch_ms")
+    base["connection"] = {
+        "attributes": {
+            "qualifiedName": "default/omni/1733000000000/model/abc123/topic/x"
+        }
+    }
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1733000000000"
+
+
+# ---------------------------------------------------------------------------
 # Values from payload (state store)
 # ---------------------------------------------------------------------------
 

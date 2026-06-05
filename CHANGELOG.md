@@ -4,6 +4,33 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-06-05
+
+**Form-field cleanup.** v0.2.4's workflow registration fix unblocked
+end-to-end dispatch, but the first real run on
+`marketplace-partner.atlan.com` failed in `get_workflow_args` because
+the activity required `connection_epoch_ms` as a form field — and the
+Atlan UI doesn't collect it (the epoch is already embedded in the
+Connection's qualifiedName at `base_args["connection"]`).
+
+### Changed
+
+- `app/activities.py::get_workflow_args` derives `connection_epoch_ms`
+  from `base_args["connection"].attributes.qualifiedName` (third segment
+  of `default/omni/<epoch>/...`) before falling back to a form field.
+  The form-field path remains so the local playground keeps working.
+  The 13-digit validation is unchanged so malformed connections still
+  fail loud.
+- `app/frontend/workflow.json` — `connection_epoch_ms` is now
+  `required: false` with help text noting it's auto-derived in
+  production and only relevant for local runs.
+
+### Added
+
+- Tests covering Connection-QN derivation, Connection-QN precedence
+  over a stale form field, malformed-QN fallback to the form field,
+  and asset-style QNs with extra segments.
+
 ## [0.2.4] - 2026-06-04
 
 **Workflow registration fix.** v0.2.3 resolved Test Authentication on

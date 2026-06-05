@@ -41,18 +41,29 @@ class ActivitiesClass(ActivitiesInterface):
                     return src[key]
             return None
 
-        connection_epoch_ms = str(_form_value("connection_epoch_ms") or "").strip()
+        # connection_epoch_ms is the third segment of the Atlan Connection's
+        # qualifiedName (default/omni/<epoch_ms>). The marketplace UI doesn't
+        # collect it as a form field — the SDK hands the resolved Connection
+        # to us via base_args["connection"]. Local playground runs don't have
+        # that blob, so fall back to the form field there.
+        connection_blob = base_args.get("connection") or {}
+        qn = (connection_blob.get("attributes") or {}).get("qualifiedName") or ""
+        connection_epoch_ms = qn.split("/")[2] if qn.count("/") >= 2 else ""
+        if not connection_epoch_ms:
+            connection_epoch_ms = str(_form_value("connection_epoch_ms") or "").strip()
         if not connection_epoch_ms or not connection_epoch_ms.isdigit():
             logger.error(
                 f"connection_epoch_ms validation failed. "
                 f"base_keys={sorted(base_args.keys())} "
-                f"received_value={_form_value('connection_epoch_ms')!r}"
+                f"connection_qn={qn!r} "
+                f"form_value={_form_value('connection_epoch_ms')!r}"
             )
             raise ApplicationError(
-                "connection_epoch_ms is required and must be a numeric "
-                "millisecond epoch (13 digits, e.g. 1747156800000). It "
-                "identifies the Atlan-side Connection that anchors all "
-                "Omni asset qualifiedNames.",
+                "Could not resolve a numeric connection_epoch_ms (13-digit "
+                "millisecond epoch). Expected to derive it from the third "
+                "segment of base_args['connection'].attributes.qualifiedName "
+                "(default/omni/<epoch_ms>) or from a connection_epoch_ms "
+                "form field for local playground runs.",
                 non_retryable=True,
             )
         page_size_raw = _form_value("page_size") or 50
