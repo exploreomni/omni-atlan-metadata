@@ -4,6 +4,40 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-06-05
+
+**Connection-shape tolerance + runtime credential resolution.** Two
+follow-on issues surfaced from Atlan's deeper review of v0.2.5. Patches
+ready-to-apply, validated against v0.2.5 by the Atlan partner team.
+
+### Changed
+
+- `app/activities.py::get_workflow_args` — Connection lookup is now
+  tolerant of all three shapes the platform actually delivers: the flat
+  Atlan-normalized `connection_qualified_name`, the Atlas-shaped
+  `attributes.qualifiedName`, and the stringified-JSON form that Argo
+  parameter passing produces. Falls back across `base_args["connection"]`
+  and `metadata_in["connection"]`.
+- `app/activities.py::get_workflow_args` — ferries `credential_guid`
+  through to the next activity but never resolves it. The return value
+  is a Temporal activity result and would otherwise persist secrets in
+  workflow history.
+- `app/activities.py::extract_and_transform_metadata` — when a
+  `credential_guid` is present and no inline credentials are provided
+  (the production path), resolve `omni_base_url` / `omni_api_token`
+  from `SecretStore.get_credentials(credential_guid)` immediately
+  before `handler.load`. Accepts both the wire-shape `host` / `password`
+  and the semantic key names from the SecretStore. Inline credentials
+  (local playground) skip the SecretStore round-trip entirely.
+
+### Added
+
+- 7 tests covering the three Connection shapes (snake_case flat,
+  stringified-JSON Atlas, `metadata.connection` JSON) and the four
+  credential-resolution paths (guid ferried but not awaited in
+  `get_workflow_args`, guid resolved in `extract_and_transform_metadata`,
+  inline credentials skip the store, no-guid passthrough).
+
 ## [0.2.5] - 2026-06-05
 
 **Form-field cleanup.** v0.2.4's workflow registration fix unblocked

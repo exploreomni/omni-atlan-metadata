@@ -10,6 +10,7 @@ from application_sdk.activities import ActivitiesInterface
 from application_sdk.constants import TEMPORARY_PATH
 from application_sdk.io.json import JsonFileWriter
 from application_sdk.observability.logger_adaptor import get_logger
+from application_sdk.services.secretstore import SecretStore
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -46,8 +47,30 @@ class ActivitiesClass(ActivitiesInterface):
         # collect it as a form field — the SDK hands the resolved Connection
         # to us via base_args["connection"]. Local playground runs don't have
         # that blob, so fall back to the form field there.
-        connection_blob = base_args.get("connection") or {}
-        qn = (connection_blob.get("attributes") or {}).get("qualifiedName") or ""
+        def _parse_connection(value: Any) -> dict:
+            # Argo parameters are always strings — the connection widget
+            # delivers stringified JSON; state-store paths deliver dicts.
+            if isinstance(value, str) and value.strip():
+                try:
+                    value = json.loads(value)
+                except (ValueError, TypeError):
+                    logger.warning("connection is not valid JSON; ignoring.")
+                    return {}
+            return value if isinstance(value, dict) else {}
+
+        def _connection_qualified_name() -> str:
+            # Platform-normalized flat key first, Atlas-shaped attributes
+            # fallback, metadata.connection as a last resort.
+            for source in (base_args.get("connection"), metadata_in.get("connection")):
+                blob = _parse_connection(source)
+                qn = blob.get("connection_qualified_name") or (
+                    blob.get("attributes") or {}
+                ).get("qualifiedName")
+                if qn:
+                    return str(qn)
+            return ""
+
+        qn = _connection_qualified_name()
         connection_epoch_ms = qn.split("/")[2] if qn.count("/") >= 2 else ""
         if not connection_epoch_ms:
             connection_epoch_ms = str(_form_value("connection_epoch_ms") or "").strip()
@@ -133,6 +156,9 @@ class ActivitiesClass(ActivitiesInterface):
             "workflow_id": base_args.get("workflow_id", "omni-extraction"),
             "workflow_run_id": base_args.get("workflow_run_id", "local-run"),
             "output_path": output_path,
+            # Pass the guid, never the resolved secrets: this dict is an
+            # activity result, which Temporal persists in event history.
+            "credential_guid": str(base_args.get("credential_guid") or "").strip(),
             "credentials": credentials,
             "metadata": metadata,
         }
@@ -141,8 +167,28 @@ class ActivitiesClass(ActivitiesInterface):
     async def extract_and_transform_metadata(
         self, args: Dict[str, Any]
     ) -> Dict[str, Any]:
+        credentials = dict(args.get("credentials") or {})
+        credential_guid = str(args.get("credential_guid") or "").strip()
+        if credential_guid and not (
+            credentials.get("omni_base_url") and credentials.get("omni_api_token")
+        ):
+            # Production path: the operator's credential values live in the
+            # credential store keyed by credential_guid (stored as host /
+            # password). Resolve them here, inside the activity, so the
+            # secrets never appear in an activity result.
+            resolved = await SecretStore.get_credentials(credential_guid)
+            credentials["omni_base_url"] = (
+                credentials.get("omni_base_url")
+                or resolved.get("host")
+                or resolved.get("omni_base_url")
+            )
+            credentials["omni_api_token"] = (
+                credentials.get("omni_api_token")
+                or resolved.get("password")
+                or resolved.get("omni_api_token")
+            )
         try:
-            await self.handler.load(credentials=args["credentials"])
+            await self.handler.load(credentials=credentials)
             snapshot = await self.handler.fetch_metadata(metadata=args["metadata"])
         except NonRetryableOmniApiError as exc:
             raise ApplicationError(str(exc), non_retryable=True) from exc

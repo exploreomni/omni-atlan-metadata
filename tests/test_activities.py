@@ -1,5 +1,7 @@
 """Tests for app/activities.py — focuses on get_workflow_args config normalization."""
 
+import json
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -266,3 +268,193 @@ async def test_source_connection_map_invalid_json_yields_empty():
     )
     result = await _call_get_workflow_args({}, base)
     assert result["metadata"]["atlan_source_connection_map"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Connection-shape tolerance (the platform delivers three shapes)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_connection_epoch_derived_from_atlan_normalized_connection_qn():
+    # Atlan create-configs normalizes the Connection asset into this
+    # snake_case shape before saving workflow args into the state store.
+    base = _make_base_args()
+    base["payload"].pop("connection_epoch_ms")
+    base["connection"] = {
+        "connection_name": "Omni",
+        "connection_qualified_name": "default/omni/1733000000000",
+    }
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1733000000000"
+
+
+@pytest.mark.asyncio
+async def test_connection_epoch_derived_from_stringified_connection_blob():
+    # Argo parameters are strings — the connection widget delivers the
+    # Connection asset as stringified JSON (observed on the saved tenant
+    # workflow template).
+    base = _make_base_args()
+    base["payload"].pop("connection_epoch_ms")
+    base["connection"] = json.dumps(
+        {"attributes": {"qualifiedName": "default/omni/1733000000000"}}
+    )
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1733000000000"
+
+
+@pytest.mark.asyncio
+async def test_connection_epoch_derived_from_metadata_connection_json():
+    # Defensive fallback for payloads where create-configs preserved the raw
+    # Atlas-shaped connection JSON under metadata.connection.
+    base = _make_base_args()
+    base["payload"].pop("connection_epoch_ms")
+    base["metadata"] = {
+        "connection": "{\"attributes\":{\"qualifiedName\":\"default/omni/1733000000000\"}}"
+    }
+    result = await _call_get_workflow_args({}, base)
+    assert result["metadata"]["connection_epoch_ms"] == "1733000000000"
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution (per-activity; secrets never returned from an activity)
+# ---------------------------------------------------------------------------
+
+RESOLVED_CREDENTIAL = {
+    "host": "https://partneratlan.omniapp.co/api",
+    "port": 443,
+    "authType": "apikey",
+    "password": "tok-secret",
+    "extra": {},
+}
+
+EMPTY_SNAPSHOT = {
+    "connections": [],
+    "models": [],
+    "topics": [],
+    "folders": [],
+    "documents": [],
+}
+
+
+def _contains_value(obj, needle: str) -> bool:
+    """Recursively check a nested structure for a string value."""
+    if isinstance(obj, str):
+        return needle in obj
+    if isinstance(obj, dict):
+        return any(_contains_value(v, needle) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_value(v, needle) for v in obj)
+    return False
+
+
+async def _call_extract(args: dict, handler) -> dict:
+    from app.activities import ActivitiesClass
+
+    activities = ActivitiesClass(handler=handler)
+    writer = MagicMock()
+    writer.write = AsyncMock()
+    stats = MagicMock()
+    stats.total_record_count = 0
+    writer.close = AsyncMock(return_value=stats)
+    with patch("app.activities.JsonFileWriter", return_value=writer):
+        return await activities.extract_and_transform_metadata(args)
+
+
+def _make_extract_args(overrides: dict | None = None) -> dict:
+    args = {
+        "workflow_id": "wf-123",
+        "workflow_run_id": "run-456",
+        "output_path": "./local/tmp/wf-123/run-456",
+        "credential_guid": "",
+        "credentials": {
+            "omni_base_url": None,
+            "omni_api_token": None,
+            "verify_ssl": True,
+            "timeout_seconds": 30,
+            "rate_limit_rpm": 60,
+        },
+        "metadata": {
+            "connection_epoch_ms": "1780514137",
+            "page_size": 50,
+            "max_pages": None,
+            "output_file": "omni_entities.ndjson",
+            "save_output_local": False,
+            "max_concurrency": 10,
+            "atlan_source_connection_map": {},
+        },
+    }
+    if overrides:
+        args.update(overrides)
+    return args
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_args_passes_guid_and_never_secrets():
+    # get_workflow_args must ferry credential_guid but never resolve it:
+    # its return value is an activity result, persisted in Temporal history.
+    base = _make_base_args()
+    base["credential_guid"] = "b8b7ec20-ee9c-4ffc-8ddd-86c7809e1074"
+    mock = AsyncMock(return_value=RESOLVED_CREDENTIAL)
+    with patch("app.activities.SecretStore.get_credentials", new=mock):
+        result = await _call_get_workflow_args({}, base)
+    mock.assert_not_awaited()
+    assert result["credential_guid"] == "b8b7ec20-ee9c-4ffc-8ddd-86c7809e1074"
+    assert not _contains_value(result, "tok-secret")
+    assert result["credentials"]["omni_base_url"] is None
+    assert result["credentials"]["omni_api_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_extract_resolves_credentials_from_guid():
+    args = _make_extract_args(
+        {"credential_guid": "b8b7ec20-ee9c-4ffc-8ddd-86c7809e1074"}
+    )
+    handler = MagicMock()
+    handler.load = AsyncMock()
+    handler.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
+    with patch(
+        "app.activities.SecretStore.get_credentials",
+        new=AsyncMock(return_value=RESOLVED_CREDENTIAL),
+    ):
+        result = await _call_extract(args, handler)
+    loaded = handler.load.await_args.kwargs["credentials"]
+    assert loaded["omni_base_url"] == "https://partneratlan.omniapp.co/api"
+    assert loaded["omni_api_token"] == "tok-secret"
+    assert loaded["verify_ssl"] is True
+    # The activity result must not leak the secret either.
+    assert not _contains_value(result, "tok-secret")
+
+
+@pytest.mark.asyncio
+async def test_extract_inline_credentials_skip_secretstore():
+    # Form-provided credentials (playground) win; no store round-trip.
+    args = _make_extract_args(
+        {"credential_guid": "b8b7ec20-ee9c-4ffc-8ddd-86c7809e1074"}
+    )
+    args["credentials"]["omni_base_url"] = "https://org.omniapp.co/api"
+    args["credentials"]["omni_api_token"] = "tok-inline"
+    handler = MagicMock()
+    handler.load = AsyncMock()
+    handler.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
+    mock = AsyncMock()
+    with patch("app.activities.SecretStore.get_credentials", new=mock):
+        await _call_extract(args, handler)
+    mock.assert_not_awaited()
+    loaded = handler.load.await_args.kwargs["credentials"]
+    assert loaded["omni_api_token"] == "tok-inline"
+
+
+@pytest.mark.asyncio
+async def test_extract_no_guid_passes_credentials_through():
+    args = _make_extract_args()
+    args["credentials"]["omni_base_url"] = "https://org.omniapp.co/api"
+    args["credentials"]["omni_api_token"] = "tok-local"
+    handler = MagicMock()
+    handler.load = AsyncMock()
+    handler.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
+    mock = AsyncMock()
+    with patch("app.activities.SecretStore.get_credentials", new=mock):
+        await _call_extract(args, handler)
+    mock.assert_not_awaited()
+    loaded = handler.load.await_args.kwargs["credentials"]
+    assert loaded["omni_base_url"] == "https://org.omniapp.co/api"
