@@ -204,7 +204,7 @@ class ActivitiesClass(ActivitiesInterface):
         # Write entities via the SDK writer, which uploads to the Atlan object store
         # (when ENABLE_ATLAN_UPLOAD=true in production) or writes locally (in dev).
         writer = JsonFileWriter(
-            path=args["output_path"],
+            path=os.path.join(args["output_path"], "transformed"),
             typename="omni_entities",
             retain_local_copy=args["metadata"].get("save_output_local", False),
         )

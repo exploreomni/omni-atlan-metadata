@@ -4,6 +4,20 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-06-22
+
+**Publishing fix.** v0.2.6 ran green but no assets landed in Atlan's
+catalog: `JsonFileWriter` was writing to the root of `output_path`,
+while Atlan's convert/publish step reads from a `transformed/`
+subdirectory (the SDK's own convention, mirroring how `sql.py` does
+`os.path.join(output_path, "transformed")`). One-line fix.
+
+### Fixed
+
+- `app/activities.py::extract_and_transform_metadata` — point
+  `JsonFileWriter` at `os.path.join(args["output_path"], "transformed")`
+  so the publish step finds the NDJSON files.
+
 ## [0.2.6] - 2026-06-05
 
 **Connection-shape tolerance + runtime credential resolution.** Two
