@@ -176,7 +176,7 @@ def test_model_attributes_map_to_standard_asset_fields():
     assert attrs["name"] == "Sales Model"
     assert attrs["description"] == "All revenue topics"
     assert attrs["connectorName"] == "omni"
-    assert attrs["sourceUpdatedAt"] == "2024-01-01T00:00:00+00:00"
+    assert attrs["sourceUpdatedAt"] == 1704067200000
     assert attrs["omniV01ModelKind"] == "SHARED"
     assert attrs["omniV01Scope"] == "ORGANIZATION"
 
@@ -184,7 +184,7 @@ def test_model_attributes_map_to_standard_asset_fields():
 def test_document_uses_source_url_and_source_updated_at():
     d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
     assert d["attributes"]["sourceURL"] == "https://app.omni.co/doc1"
-    assert d["attributes"]["sourceUpdatedAt"] == "2024-06-01T00:00:00+00:00"
+    assert d["attributes"]["sourceUpdatedAt"] == 1717200000000
     assert d["attributes"]["omniV01Url"] == "https://app.omni.co/doc1"
 
 

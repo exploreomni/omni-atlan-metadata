@@ -18,6 +18,7 @@ default/omni/{connection_epoch_ms} qualifiedName.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 # Atlan-side enum value sets — defensive normalization for upstream Omni
@@ -26,6 +27,18 @@ from typing import Any
 # deterministically from `hasDashboard`, not normalized from a string.
 _MODEL_KINDS = {"SHARED", "WORKBOOK"}
 _SCOPES = {"ORGANIZATION", "WORKSPACE", "PRIVATE", "SHARED"}
+
+
+def _epoch_ms(value: str | None) -> int | None:
+    """Convert an ISO-8601 datetime string to epoch milliseconds.
+
+    Atlan's date attributes (e.g. sourceUpdatedAt) are stored as epoch-ms
+    integers. Passing an ISO string causes Atlas date validation to reject
+    the entity on create.
+    """
+    if not value:
+        return None
+    return int(datetime.fromisoformat(value).timestamp() * 1000)
 
 
 class OmniMetadataTransformer:
@@ -157,7 +170,7 @@ class OmniMetadataTransformer:
                 "connectorName": "omni",
                 "omniV01Id": model_id,
                 "omniV01ModelKind": model_kind,
-                "sourceUpdatedAt": row.get("updatedAt"),
+                "sourceUpdatedAt": _epoch_ms(row.get("updatedAt")),
             }
             description = row.get("description")
             if description:
@@ -204,7 +217,7 @@ class OmniMetadataTransformer:
                 "connectorName": "omni",
                 "omniV01Id": topic_name,
                 "omniV01BaseViewName": row.get("baseViewName"),
-                "sourceUpdatedAt": row.get("updatedAt"),
+                "sourceUpdatedAt": _epoch_ms(row.get("updatedAt")),
             }
             description = row.get("description")
             if description:
@@ -280,7 +293,7 @@ class OmniMetadataTransformer:
                 "omniV01Url": row.get("url"),
                 "omniV01FolderPath": folder.get("path"),
                 "sourceURL": row.get("url"),
-                "sourceUpdatedAt": row.get("updatedAt"),
+                "sourceUpdatedAt": _epoch_ms(row.get("updatedAt")),
             }
             description = row.get("description")
             if description:

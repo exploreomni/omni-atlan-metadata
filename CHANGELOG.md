@@ -4,6 +4,21 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-06-24
+
+**Date attribute fix.** v0.2.7 wrote `sourceUpdatedAt` as ISO-8601 strings
+(`2026-05-27T19:24:23.616000+00:00`). Atlan's Atlas store requires date
+attributes to be epoch milliseconds (`1782749725000`); the ISO string
+failed date validation and all OmniV01* entities were rejected on create.
+The Connection has no date field, which is why it created fine.
+
+### Fixed
+
+- `app/transformer.py` — added `_epoch_ms()` helper that converts an
+  ISO-8601 string to epoch milliseconds via `datetime.fromisoformat`.
+  Applied at all three `sourceUpdatedAt` sites (Model, Topic, Document).
+  `None` input passes through as `None` unchanged.
+
 ## [0.2.7] - 2026-06-22
 
 **Publishing fix.** v0.2.6 ran green but no assets landed in Atlan's
