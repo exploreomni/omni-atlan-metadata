@@ -1,0 +1,17 @@
+name: omni-app
+app_id: 019e518e-7294-7ef3-8b02-2ebc1f7faaf0
+display_name: "Omni"
+type: connector
+
+# Keeps the worker on stable (non-interruptible) capacity at a fixed size.
+# Interruptible + auto-resize from idle usage was yanking the worker mid-crawl
+# on several runs (Atlan feedback 2026-10-06). Must live here because the CLI
+# posts it as the Version config and each new deploy replaces it.
+deploy:
+  workerCapacityType: on_demand
+  workerResources:
+    requests: {cpu: "1", memory: 4Gi}
+    limits:   {cpu: "2", memory: 6Gi}
+  vpa:
+    enabled: true
+    updateMode: "Off"
