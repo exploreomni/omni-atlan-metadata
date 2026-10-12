@@ -4,6 +4,68 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-10-06
+
+Follow-on fixes from Atlan's review of six v0.4.1 runs on a large customer
+estate (~5,200 models) that hit the 8h ceiling at a configured 30 rpm. The
+crawl was rate-bound — exactly 1,800 requests per full hour — and the budget
+went to requests that could not succeed: ~65% were a pair of topic-detail
+404s (owner probe, then per-model probe) re-issued once per inheriting model
+for two topics Omni cannot compile, and a further 7-21% were 3x rate-limit
+retries of a FIXED set of 585 model-YAML 403s that never clear. Projected:
+~14h -> ~4.2h at 30 rpm, assuming the measured ~65% 404 share and ~585
+forbidden-model proportions hold across a full crawl; the emitted rows are
+unchanged.
+
+### Fixed
+
+- **A confirmed topic-detail 404 is memoized.** `_fetch_topic_detail_cached`
+  now caches `{}` for a key the topic API answered 404 — Omni saying it cannot
+  compile that topic, which no retry changes — so it is fetched once per
+  owning model rather than once per inheriting model. Only a confirmed 404 is
+  cached; a transient or other failure is still re-attempted, as before.
+
+- **The per-model topic probe is skipped when it provably cannot help.** SHARED
+  models record a hash of each `.topic` file as their combined YAML is fetched
+  (SHARED models are now submitted to the pool first; if an inheriting model
+  gets ahead, the owner's YAML is fetched once under a per-owner single-flight
+  lock and handed to the owner's own pass). When the owner's
+  probe was a confirmed 404 AND the inheriting model's `.topic` file is
+  byte-identical to the owner's, the model is asking Omni to compile the same
+  broken definition, so the second probe is skipped. A file the owner lacks or
+  whose content differs (`BRANCH` / extension-defined) keeps the probe;
+  genuinely overridden topics are unchanged. The emitted row is identical.
+
+- **A 403 is re-checked once, then treated as forbidden — not retried 3x.**
+  Omni answers a rapid burst with 403 "Invalid bearer token", but it also
+  answers a model the token cannot read with 403, and that one never clears.
+  A 403 now gets one re-check after ~5-7s (long enough for a burst to drain;
+  every attempt still passes the rpm gate); a second 403 raises
+  `OmniForbiddenError` (non-retryable, body snippet in the message). A 429 or
+  5xx after the re-check takes the existing backoff ladder. Forbidden models
+  are tallied as `model_yaml_forbidden`, apart from `model_yaml`, so they
+  cannot push a run over the existing 20% abort threshold — and a new
+  run-level check covers the case where the 403s were never per-model: if
+  more than `_FORBIDDEN_ABORT_RATIO` (30%) of the models attempted are
+  forbidden, after at least 50 attempted — or if EVERY model attempted is
+  forbidden, whatever the count — the run aborts with "N of M models
+  returned 403 even after a recheck — this looks like rate limiting or a
+  token problem, not per-model permissions; lower rate_limit_rpm or check the
+  token."
+
+### Changed
+
+- `_topic_detail_from_views` logs the unresolved view name(s) at WARNING, once
+  per (owning model, topic, names) per run, when it falls back to the topic
+  API — the worker log previously never said which view caused the single
+  most expensive thing a crawl does.
+- Stats `topic_detail_404_keys_cached`, `topic_detail_probe_b_skipped`,
+  `topic_unresolved_views` and the failure tally `model_yaml_forbidden` ride
+  the progress line and the end-of-pass summary; forbidden model ids are
+  listed once at the end of the model pass.
+- `transformer.transform` runs in a worker thread (`asyncio.to_thread`) so a
+  large snapshot's transform no longer blocks the activity heartbeat.
+
 ## [0.4.1] - 2026-08-31
 
 Follow-on fixes from Atlan's review of the v0.4.0 image on a large tenant

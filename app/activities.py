@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -236,7 +237,10 @@ class ActivitiesClass(ActivitiesInterface):
             connection_epoch_ms=args["metadata"]["connection_epoch_ms"],
             atlan_source_connection_map=args["metadata"].get("atlan_source_connection_map", {}),
         )
-        entities = transformer.transform(snapshot=snapshot)
+        # The transform is CPU-bound and synchronous; on a large snapshot it
+        # blocks the event loop long enough to stall `auto_heartbeater`. Run it
+        # off-loop so heartbeats keep flowing.
+        entities = await asyncio.to_thread(transformer.transform, snapshot=snapshot)
 
         # Write entities via the SDK writer, which uploads to the Atlan object store
         # (when ENABLE_ATLAN_UPLOAD=true in production) or writes locally (in dev).

@@ -1076,3 +1076,519 @@ def test_genuinely_absent_view_still_gives_up():
     assert client._topic_detail_from_views(
         {"base_view": "nowhere__missing"}, "nowhere__missing", views, {}
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Request-budget fixes measured on a large estate (~5,200 models).
+#
+# ~65% of that crawl's requests were a pair of topic-detail 404s re-issued once
+# per inheriting model; a further 7-21% were 3x retries of a fixed set of
+# model-YAML 403s that never clear. These pin the behaviors that stop it:
+# confirmed-404 negative cache, probe-B skip on byte-identical topic files,
+# 403 re-checked once then forbidden, and a run-level forbidden abort.
+# ---------------------------------------------------------------------------
+
+import re
+import threading
+import time as _time
+from concurrent.futures import ThreadPoolExecutor
+
+_LISTING_EMPTY = {"records": [], "pageInfo": {"hasNextPage": False}}
+
+
+def _mock_listings(models: list[dict]) -> None:
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(
+            200, json={"records": models, "pageInfo": {"hasNextPage": False}}
+        )
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json=_LISTING_EMPTY)
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json=_LISTING_EMPTY)
+    )
+
+
+def _quiet_client(monkeypatch) -> ClientClass:
+    """A client whose retry / re-check sleeps are no-ops."""
+    monkeypatch.setattr("app.client.time.sleep", lambda _s: None)
+    return make_client()
+
+
+_SHARED_WB_MODELS = [
+    {"id": "shared1", "modelKind": "SHARED"},
+    {"id": "wb1", "name": "Workbook 1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+]
+_ORDERS_TOPIC = "label: Orders\nbase_view: orders_view\n"
+
+
+def _mock_yaml(model_id: str, files: dict, mode: str = "combined"):
+    return respx.get(
+        f"https://test.omniapp.co/api/v1/models/{model_id}/yaml", params={"mode": mode}
+    ).mock(return_value=httpx.Response(200, json={"files": files}))
+
+
+def _capture(monkeypatch, level: str) -> list[str]:
+    lines: list[str] = []
+    monkeypatch.setattr(
+        f"app.client.logger.{level}", lambda msg, *a, **k: lines.append(str(msg))
+    )
+    return lines
+
+
+# --- 1. confirmed-404 negative cache ---------------------------------------
+
+@respx.mock
+def test_topic_detail_confirmed_404_is_cached():
+    """A 404 is Omni saying it cannot compile the topic; it does not change on
+    retry, so the second inheriting model must not re-issue it."""
+    client = make_client()
+    route = respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404, text="Not found")
+    )
+    assert client._fetch_topic_detail_cached("shared1", "orders") == {}
+    assert client._fetch_topic_detail_cached("shared1", "orders") == {}
+    assert route.call_count == 1
+    assert client._stats["topic_detail_404_keys_cached"] == 1
+    assert client._failures["topic_detail"] == 1
+
+
+@respx.mock
+def test_topic_detail_non_404_failure_is_still_not_cached():
+    """Only a confirmed 404 is memoized. Any other failure keeps the docstring's
+    original promise: re-attempt rather than permanently blank the topic."""
+    client = make_client()
+    route = respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(400, text="bad")
+    )
+    assert client._fetch_topic_detail_cached("shared1", "orders") == {}
+    assert client._fetch_topic_detail_cached("shared1", "orders") == {}
+    assert route.call_count == 2
+    assert client._stats["topic_detail_404_keys_cached"] == 0
+    assert ("shared1", "orders") not in client._topic_detail_not_found
+
+
+# --- 2. probe B skipped only when it provably cannot help -----------------
+
+@respx.mock
+def test_probe_b_skipped_when_inheriting_copy_is_byte_identical_to_owner():
+    _mock_listings(_SHARED_WB_MODELS)
+    _mock_yaml("shared1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {}, mode="extension")
+    owner_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/shared1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+
+    client = make_client()
+    snapshot = client.fetch_snapshot(crawl_only_content_backed_workbooks=False)
+
+    assert owner_probe.call_count == 1
+    assert model_probe.call_count == 0, "probe B re-issued a 404 it could predict"
+    assert client._stats["topic_detail_probe_b_skipped"] == 1
+    # The emitted row is IDENTICAL to what the double-404 path produced before:
+    # YAML-only fields, no lineage keys.
+    wb_topic = next(t for t in snapshot["topics"] if t["modelId"] == "wb1")
+    assert wb_topic == {
+        "modelId": "wb1",
+        "owningModelId": "shared1",
+        "name": "orders",
+        "label": "Orders",
+        "baseViewName": "orders_view",
+    }
+    assert client._prefetched_yaml == {}
+
+
+@respx.mock
+def test_probe_b_runs_when_inheriting_copy_differs_from_owner():
+    """A BRANCH / extension-defined topic has different content — the model
+    itself may compile it, so the per-model probe still runs."""
+    _mock_listings(_SHARED_WB_MODELS)
+    _mock_yaml("shared1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC + "joins:\n  users: {}\n"})
+    _mock_yaml("wb1", {}, mode="extension")
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+
+    client = make_client()
+    client.fetch_snapshot(crawl_only_content_backed_workbooks=False)
+    assert model_probe.call_count == 1
+    assert client._stats["topic_detail_probe_b_skipped"] == 0
+
+
+@respx.mock
+def test_probe_b_runs_when_owner_lacks_the_topic_file():
+    _mock_listings(_SHARED_WB_MODELS)
+    _mock_yaml("shared1", {"other.topic": "label: Other\n"})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {}, mode="extension")
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/other").mock(
+        return_value=httpx.Response(404)
+    )
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+
+    client = make_client()
+    client.fetch_snapshot(crawl_only_content_backed_workbooks=False)
+    assert model_probe.call_count == 1
+
+
+@respx.mock
+def test_probe_b_runs_when_owner_failure_was_not_a_confirmed_404():
+    """A transient owner failure is not evidence the model will 404 too."""
+    _mock_listings(_SHARED_WB_MODELS)
+    _mock_yaml("shared1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {}, mode="extension")
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(400, text="bad")
+    )
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(200, json={"topic": {"views": []}}))
+
+    client = make_client()
+    client.fetch_snapshot(crawl_only_content_backed_workbooks=False)
+    assert model_probe.call_count == 1
+
+
+@respx.mock
+def test_probe_b_skip_does_not_apply_to_genuinely_overridden_topics():
+    """owning == model for an override: the existing single probe is unchanged."""
+    _mock_listings(_SHARED_WB_MODELS)
+    _mock_yaml("shared1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC}, mode="extension")
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+
+    client = make_client()
+    snapshot = client.fetch_snapshot(crawl_only_content_backed_workbooks=False)
+    wb_topic = next(t for t in snapshot["topics"] if t["modelId"] == "wb1")
+    assert wb_topic["owningModelId"] == "wb1"
+    assert model_probe.call_count == 1
+    assert client._stats["topic_detail_probe_b_skipped"] == 0
+
+
+@respx.mock
+def test_owner_yaml_costs_one_request_even_when_inheriting_model_runs_first():
+    """If a workbook gets ahead of its SHARED owner in the pool, the owner's
+    YAML is fetched lazily for the hash comparison and then REUSED by the
+    owner's own pass — never fetched twice, and nothing left parked."""
+    owner_yaml = _mock_yaml("shared1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {}, mode="extension")
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+
+    client = make_client()
+    client._model_lookup = {m["id"]: m for m in _SHARED_WB_MODELS}
+    wb_topics = client._fetch_topics_for_model(_SHARED_WB_MODELS[1])
+    assert owner_yaml.call_count == 1
+    assert model_probe.call_count == 0
+    assert wb_topics[0]["owningModelId"] == "shared1"
+    assert "shared1" in client._prefetched_yaml
+
+    owner_topics = client._fetch_topics_for_model(_SHARED_WB_MODELS[0])
+    assert owner_yaml.call_count == 1, "owner YAML fetched twice"
+    assert owner_topics[0]["modelId"] == "shared1"
+    assert client._prefetched_yaml == {}
+
+
+@respx.mock
+def test_owner_yaml_is_single_flight_when_owner_and_inheritor_race():
+    """Owner's YAML slow and in flight while the inheriting model reaches the
+    hash comparison: exactly one owner request, nothing left in
+    `_prefetched_yaml`, and the inheritor still gets the skip."""
+    calls = {"owner_yaml": 0}
+
+    def slow_owner(request):
+        calls["owner_yaml"] += 1
+        _time.sleep(0.5)
+        return httpx.Response(200, json={"files": {"orders.topic": _ORDERS_TOPIC}})
+
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/yaml").mock(side_effect=slow_owner)
+    _mock_yaml("wb1", {"orders.topic": _ORDERS_TOPIC})
+    _mock_yaml("wb1", {}, mode="extension")
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    model_probe = respx.get(
+        "https://test.omniapp.co/api/v1/models/wb1/topic/orders"
+    ).mock(return_value=httpx.Response(404))
+
+    client = make_client()
+    client._model_lookup = {m["id"]: m for m in _SHARED_WB_MODELS}
+    t_owner = threading.Thread(target=client._fetch_topics_for_model, args=(_SHARED_WB_MODELS[0],))
+    t_owner.start()
+    _time.sleep(0.1)
+    client._fetch_topics_for_model(_SHARED_WB_MODELS[1])
+    t_owner.join()
+
+    assert calls["owner_yaml"] == 1
+    assert client._prefetched_yaml == {}
+    assert model_probe.call_count == 0
+    assert client._stats["topic_detail_probe_b_skipped"] == 1
+
+
+# --- 3. 403: re-check once, then forbidden; run-level abort ---------------
+
+@respx.mock
+def test_isolated_403_is_rechecked_once_then_forbidden(monkeypatch):
+    from app.client import OmniForbiddenError
+
+    client = _quiet_client(monkeypatch)
+    acquires: list[int] = []
+    real_acquire = client._rate_limiter.acquire
+    monkeypatch.setattr(
+        client._rate_limiter, "acquire", lambda: (acquires.append(1), real_acquire())
+    )
+    route = respx.get(
+        "https://test.omniapp.co/api/v1/models/m1/yaml", params={"mode": "combined"}
+    ).mock(return_value=httpx.Response(403, text='{"detail":"Forbidden for m1"}'))
+
+    with pytest.raises(OmniForbiddenError) as excinfo:
+        client.get_model_yaml("m1")
+    assert route.call_count == 2, "exactly one re-check, no backoff ladder"
+    assert len(acquires) == 2, "every attempt must pass the rpm gate"
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.retryable is False
+    assert "Forbidden for m1" in excinfo.value.body
+
+
+@respx.mock
+def test_403_recheck_that_returns_200_is_processed_normally(monkeypatch):
+    client = _quiet_client(monkeypatch)
+    _mock_listings([{"id": "m1"}])
+    route = respx.get(
+        "https://test.omniapp.co/api/v1/models/m1/yaml", params={"mode": "combined"}
+    )
+    route.side_effect = [
+        httpx.Response(403, text="Invalid bearer token"),
+        httpx.Response(200, json={"files": {"orders.topic": _ORDERS_TOPIC}}),
+    ]
+    respx.get("https://test.omniapp.co/api/v1/models/m1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    snapshot = client.fetch_snapshot()
+    assert route.call_count == 2
+    assert [t["modelId"] for t in snapshot["topics"]] == ["m1"]
+    assert client._failures["model_yaml_forbidden"] == 0
+    assert client._forbidden_model_ids == []
+
+
+@respx.mock
+def test_403_recheck_that_returns_429_takes_the_rate_limit_ladder(monkeypatch):
+    """403 -> re-check -> 429: that is the existing 429 backoff, not forbidden."""
+    from app.client import OmniForbiddenError
+
+    client = _quiet_client(monkeypatch)
+    route = respx.get("https://test.omniapp.co/api/v1/connections")
+    route.side_effect = [
+        httpx.Response(403, text="Invalid bearer token"),
+        httpx.Response(429, text="Rate limited"),
+        httpx.Response(200, json={"connections": [{"id": "c1"}]}),
+    ]
+    assert client.list_connections()[0]["id"] == "c1"
+    assert route.call_count == 3
+
+    # And a 429 ladder that never clears still ends retryable, never forbidden.
+    route.side_effect = [httpx.Response(403)] + [httpx.Response(429)] * 4
+    with pytest.raises(OmniApiError) as excinfo:
+        client.list_connections()
+    assert not isinstance(excinfo.value, OmniForbiddenError)
+    assert excinfo.value.retryable is True
+    assert route.call_count == 3 + 5  # 403, then 1 + 3 retries of 429
+
+
+@respx.mock
+def test_contiguous_forbidden_models_cost_two_requests_each_and_never_abort(monkeypatch):
+    """Six forbidden models adjacent in the listing, ten workers: each costs
+    exactly one request plus one re-check, none is counted as model_yaml, and
+    the run completes (6/8 = 75% forbidden, but under the min sample)."""
+    client = _quiet_client(monkeypatch)
+    warnings = _capture(monkeypatch, "warning")
+    models = [{"id": f"f{i}"} for i in range(6)] + [{"id": "ok1"}, {"id": "ok2"}]
+    _mock_listings(models)
+    forbidden_routes = {}
+    for i in range(6):
+        forbidden_routes[f"f{i}"] = respx.get(
+            f"https://test.omniapp.co/api/v1/models/f{i}/yaml", params={"mode": "combined"}
+        ).mock(return_value=httpx.Response(403, text=f"no access to f{i}"))
+    for mid in ("ok1", "ok2"):
+        _mock_yaml(mid, {"orders.topic": _ORDERS_TOPIC})
+        respx.get(f"https://test.omniapp.co/api/v1/models/{mid}/topic/orders").mock(
+            return_value=httpx.Response(404)
+        )
+
+    snapshot = client.fetch_snapshot(max_concurrency=10)
+
+    assert client._failures["model_yaml"] == 0
+    assert client._failures["model_yaml_forbidden"] == 6
+    assert sorted(client._forbidden_model_ids) == [f"f{i}" for i in range(6)]
+    for mid, route in forbidden_routes.items():
+        assert route.call_count == 2, f"{mid} cost {route.call_count} requests"
+    assert sorted(t["modelId"] for t in snapshot["topics"]) == ["ok1", "ok2"]
+    forbidden_logs = [w for w in warnings if "model YAML forbidden" in w]
+    assert len(forbidden_logs) == 6, "one WARNING per forbidden model"
+    assert any("no access to f3" in w for w in forbidden_logs), "body snippet missing"
+
+
+def _mock_estate(n_models: int, n_forbidden: int) -> None:
+    """n_models plain models, the first n_forbidden of which 403 on YAML."""
+    _mock_listings([{"id": f"m{i:03d}"} for i in range(n_models)])
+
+    def yaml_handler(request):
+        idx = int(re.search(r"/models/m(\d+)/yaml", str(request.url)).group(1))
+        if idx < n_forbidden:
+            return httpx.Response(403, text="Invalid bearer token")
+        return httpx.Response(200, json={"files": {}})
+
+    respx.get(url__regex=r".*/v1/models/m\d+/yaml.*").mock(side_effect=yaml_handler)
+
+
+@respx.mock
+def test_forbidden_share_above_ratio_aborts_with_a_token_or_rate_limit_message(monkeypatch):
+    from app.client import _FORBIDDEN_ABORT_MIN_MODELS
+
+    client = _quiet_client(monkeypatch)
+    n = _FORBIDDEN_ABORT_MIN_MODELS + 10
+    _mock_estate(n, n_forbidden=n // 3 + 1)  # just over 30%
+
+    with pytest.raises(OmniApiError, match="looks like rate limiting or a token problem") as excinfo:
+        client.fetch_snapshot(max_concurrency=4)
+    assert excinfo.value.retryable is True
+    assert f"{n // 3 + 1} of {n} models returned 403 even after a recheck" in str(excinfo.value)
+    assert "lower rate_limit_rpm or check the token" in str(excinfo.value)
+    assert client._failures["model_yaml"] == 0, "forbidden must not count as model_yaml"
+
+
+@respx.mock
+def test_every_model_forbidden_aborts_even_below_the_min_sample(monkeypatch):
+    """10 models, all 403 twice: under the 50-model minimum, but a run that can
+    read NOTHING must not complete with zero topics and report success."""
+    client = _quiet_client(monkeypatch)
+    _mock_estate(10, n_forbidden=10)
+
+    with pytest.raises(OmniApiError, match="looks like rate limiting or a token problem") as excinfo:
+        client.fetch_snapshot(max_concurrency=4)
+    assert "10 of 10 models returned 403 even after a recheck" in str(excinfo.value)
+    assert client._failures["model_yaml_forbidden"] == 10
+    assert client._failures["model_yaml"] == 0
+
+
+@respx.mock
+def test_forbidden_share_at_or_below_ratio_completes_and_lists_ids(monkeypatch):
+    from app.client import _FORBIDDEN_ABORT_MIN_MODELS
+
+    client = _quiet_client(monkeypatch)
+    warnings = _capture(monkeypatch, "warning")
+    n = _FORBIDDEN_ABORT_MIN_MODELS + 10
+    _mock_estate(n, n_forbidden=10)  # ~17%
+
+    snapshot = client.fetch_snapshot(max_concurrency=4)
+    assert len(snapshot["models"]) == n
+    assert client._failures["model_yaml_forbidden"] == 10
+    summary = [w for w in warnings if "returned 403 for their YAML" in w]
+    assert len(summary) == 1
+    assert "10 model(s)" in summary[0] and "m000" in summary[0] and "m009" in summary[0]
+
+
+# --- 4. observability -----------------------------------------------------
+
+_JOINS_TOPIC = "label: Orders\nbase_view: ecomm__order_items\njoins:\n  ghost_view: {}\n"
+
+
+@respx.mock
+def test_unresolved_view_warning_is_logged_once_per_owner_and_topic(monkeypatch):
+    """One SHARED owner, three inheriting workbooks, one topic whose `joins`
+    names a view the payload does not carry: ONE warning naming the view (and
+    the owner), one `topic_unresolved_views`, not one line per workbook."""
+    warnings = _capture(monkeypatch, "warning")
+    workbooks = [
+        {"id": f"wb{i}", "name": f"W{i}", "modelKind": "WORKBOOK", "baseModelId": "shared1"}
+        for i in range(3)
+    ]
+    _mock_listings([{"id": "shared1", "modelKind": "SHARED"}] + workbooks)
+    files = {"orders.topic": _JOINS_TOPIC, "ECOMM/order_items.view": _VIEW_BODY}
+    _mock_yaml("shared1", files)
+    for wb in workbooks:
+        _mock_yaml(wb["id"], files)
+        _mock_yaml(wb["id"], {}, mode="extension")
+        respx.get(f"https://test.omniapp.co/api/v1/models/{wb['id']}/topic/orders").mock(
+            return_value=httpx.Response(404)
+        )
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+
+    client = make_client()
+    client.fetch_snapshot(crawl_only_content_backed_workbooks=False)
+
+    unresolved = [w for w in warnings if "not derivable locally" in w]
+    assert len(unresolved) == 1, unresolved
+    assert "owning_model_id=shared1" in unresolved[0]
+    assert "ghost_view" in unresolved[0]
+    assert "ecomm__order_items" not in unresolved[0].split("unresolved")[1]
+    assert client._stats["topic_unresolved_views"] == 1
+
+
+def test_unresolved_view_warning_is_silent_without_context(monkeypatch):
+    warnings = _capture(monkeypatch, "warning")
+    client = make_client()
+    views = client._views_from_payload({"ECOMM/order_items.view": _VIEW_BODY})
+    parsed = {"base_view": "ecomm__order_items", "joins": {"ghost_view": {}}}
+    assert client._topic_detail_from_views(parsed, "ecomm__order_items", views, {}) is None
+    assert warnings == []
+    assert client._stats["topic_unresolved_views"] == 0
+
+
+def test_new_counters_reset_per_run_and_ride_the_progress_line(monkeypatch):
+    infos = _capture(monkeypatch, "info")
+    with respx.mock:
+        _mock_listings([{"id": "m1"}])
+        _mock_yaml("m1", {"orders.topic": _ORDERS_TOPIC})
+        respx.get("https://test.omniapp.co/api/v1/models/m1/topic/orders").mock(
+            return_value=httpx.Response(404)
+        )
+        client = make_client()
+        client._stats["topic_detail_probe_b_skipped"] = 99
+        client._failures["model_yaml_forbidden"] = 99
+        client.fetch_snapshot()
+    assert client._stats["topic_detail_probe_b_skipped"] == 0
+    assert client._failures["model_yaml_forbidden"] == 0
+    progress = [m for m in infos if m.startswith("fetch_snapshot progress: models")]
+    assert progress, infos
+    for key in (
+        "topic_detail_404_keys_cached=",
+        "topic_detail_probe_b_skipped=",
+        "topic_unresolved_views=",
+        "model_yaml_forbidden=",
+    ):
+        assert key in progress[-1], progress[-1]
+    summary = [m for m in infos if m.startswith("fetch_snapshot failures:")]
+    assert summary and "model_yaml_forbidden=0" in summary[0]
+    assert "topic_unresolved_views=0" in summary[0]

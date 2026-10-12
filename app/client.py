@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
+import hashlib
 import random
 import threading
 import time
@@ -21,6 +22,19 @@ OMNI_DEFAULT_RPM = 60
 
 # Omni rejects anything larger with "Page size cannot exceed 100".
 OMNI_MAX_PAGE_SIZE = 100
+
+# A 403 from Omni is ambiguous: the API answers a rapid burst with 403
+# "Invalid bearer token" rather than 429, but it also answers a model the
+# token genuinely cannot read with 403 — and that one never clears on retry.
+# One measured crawl of a large estate (~5,200 models) spent 7-21% of its
+# request budget re-trying a fixed set of 585 forbidden models three times
+# each. Rule: a 403 gets ONE re-check after a short pause (long enough for a
+# burst to drain); a second 403 is forbidden for that path. Whether the run
+# as a whole is really rate-limited (or holding a bad token) is judged on
+# the model pass, not per request: see `_FORBIDDEN_ABORT_RATIO`.
+_FORBIDDEN_RECHECK_SECONDS = 5.0
+_FORBIDDEN_RECHECK_JITTER_SECONDS = 2.0
+_FORBIDDEN_BODY_SNIPPET_CHARS = 200
 
 
 class _RateLimiter:
@@ -129,17 +143,59 @@ class NonRetryableOmniApiError(OmniApiError):
     pass
 
 
+class OmniForbiddenError(NonRetryableOmniApiError):
+    """A 403 that survived one re-check: the token cannot read this path.
+
+    Raised by `_get_json` on the second 403 for a request. `body` carries a
+    truncated response body for the operator's log line.
+    """
+
+    def __init__(self, message: str, body: str = ""):
+        super().__init__(message, status_code=403, retryable=False)
+        self.body = body
+
+
 # Per-run tallies of silently-swallowed errors, grouped by blast radius.
 # One model-YAML failure loses that whole model's topics; one topic-detail
 # failure loses one topic's enrichment; one document-detail failure loses one
 # doc's tile-topic edges. Emitting these blended into one pooled ratio hides
 # whichever is dominating, so each category is counted separately.
+# `model_yaml_forbidden` is a model the token cannot read at all (confirmed
+# 403, not a burst). It is tallied apart from `model_yaml` because it is not a
+# crawl defect, so it must not push the run over the abort threshold — and it
+# is the operator's to fix (token scope), not a retry's.
 _FAILURE_CATEGORIES = (
     "model_yaml",
+    "model_yaml_forbidden",
     "override_probe",
     "topic_detail",
     "document_detail",
 )
+
+# Per-run stats that are not failures. Surfaced on the progress line next to
+# the failures so a run's request budget is legible.
+#   topic_detail_404_keys_cached  distinct (owning model, topic) keys the topic
+#                                 API 404'd on, now memoized (keys, not the
+#                                 number of requests saved)
+#   topic_detail_probe_b_skipped  per-model topic probes not issued because
+#                                 they provably could not help
+#   topic_unresolved_views        distinct (owner, topic, unresolved views)
+#                                 that fell back to the topic API
+_STATS_CATEGORIES = (
+    "topic_detail_404_keys_cached",
+    "topic_detail_probe_b_skipped",
+    "topic_unresolved_views",
+)
+
+# If more than this share of the models attempted in the model pass answered
+# 403 even after a re-check, the 403s are not per-model permissions: the run
+# is being rate-limited (Omni answers bursts with 403) or the token is bad.
+# Abort like `_MODEL_YAML_FAILURE_ABORT_THRESHOLD` does, rather than publish a
+# crawl missing a third of its models. Judged only once a minimum sample of
+# models has been attempted, so a small org with a few forbidden models is
+# not mistaken for a token problem.
+_FORBIDDEN_ABORT_RATIO = 0.30
+_FORBIDDEN_ABORT_MIN_MODELS = 50
 
 # If more than this fraction of model-YAML fetches fail, abort after the
 # model pass — before we spend three hours on a run whose topic side will
@@ -201,6 +257,30 @@ class ClientClass:
         # distinct topics. Reset at fetch_snapshot start.
         self._topic_detail_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._topic_detail_cache_lock = threading.Lock()
+        # (model, topic) keys the topic API answered 404 for. A 404 is Omni
+        # saying it cannot compile that topic — it does not change on retry,
+        # so `_fetch_topic_detail_cached` memoizes `{}` for these (and ONLY
+        # these; a transient failure is still re-attempted).
+        self._topic_detail_not_found: set[tuple[str, str]] = set()
+        # SHARED model id -> {topic stem: sha1 of its `.topic` file content},
+        # recorded from each SHARED model's combined YAML as it is fetched (or
+        # fetched lazily once if an inheriting model needs it first). Lets an
+        # inheriting model prove its copy of a topic is byte-identical to the
+        # owner's, so a topic the owner's API already 404'd on is not probed a
+        # second time per inheriting model. Reset at fetch_snapshot start.
+        self._shared_topic_hashes: dict[str, dict[str, str]] = {}
+        self._shared_topic_hashes_lock = threading.Lock()
+        # One lock per SHARED model, held across its YAML fetch, so the lazy
+        # path and the owner's own pass can never both have it in flight.
+        self._shared_yaml_locks: dict[str, threading.Lock] = {}
+        # Combined YAML fetched by the lazy path above, handed to that model's
+        # own `_fetch_topics_for_model` so the owner costs one request, not two.
+        self._prefetched_yaml: dict[str, dict[str, Any]] = {}
+        self._stats: dict[str, int] = {k: 0 for k in _STATS_CATEGORIES}
+        # (owner, topic, unresolved view names) already warned about this run.
+        self._unresolved_views_logged: set[tuple[Any, ...]] = set()
+        # Model ids whose YAML the token cannot read (confirmed 403).
+        self._forbidden_model_ids: list[str] = []
         if credentials:
             self.load_credentials(credentials)
 
@@ -282,7 +362,12 @@ class ClientClass:
         max_rate_limit_retries = 3
         max_server_error_retries = 2
 
-        for attempt in range(max_rate_limit_retries + 1):
+        # `attempt` counts backoff retries (rate limit / 5xx / network). The
+        # single forbidden re-check below does not consume one, so a 403 that
+        # turns out to be a burst still gets the full backoff ladder.
+        attempt = 0
+        forbidden_rechecked = False
+        while True:
             # Single choke point for cooperative cancellation: once the activity
             # is cancelled no queued worker issues another customer API call.
             if self._abort is not None and self._abort.is_set():
@@ -297,6 +382,7 @@ class ClientClass:
                 if attempt < max_server_error_retries:
                     delay = (2**attempt) + random.uniform(0.0, 0.25)
                     time.sleep(delay)
+                    attempt += 1
                     continue
                 raise OmniApiError(
                     f"GET {path} failed due to network error: {exc}",
@@ -327,8 +413,35 @@ class ClientClass:
                 return data
 
             # Omni answers a rapid burst with 403 "Invalid bearer token", not
-            # 429, so 403 must back off and retry rather than hard-fail the run.
-            if status in (403, 429):
+            # 429. But a 403 on a model the token cannot read never clears,
+            # and retrying it 3x with sleeps is what ate 7-21% of one large
+            # crawl's budget. So a 403 gets ONE re-check after a pause long
+            # enough for a burst to drain; a second 403 is forbidden for this
+            # path — no further retries, non-retryable to the caller. Whether
+            # the RUN is rate-limited is judged on the model pass as a whole
+            # (`_FORBIDDEN_ABORT_RATIO`), where the signal actually lives.
+            if status == 403:
+                if not forbidden_rechecked:
+                    forbidden_rechecked = True
+                    delay = _FORBIDDEN_RECHECK_SECONDS + random.uniform(
+                        0.0, _FORBIDDEN_RECHECK_JITTER_SECONDS
+                    )
+                    logger.info(
+                        f"Omni 403 for {path}; re-checking once in {delay:.1f}s "
+                        f"before treating it as forbidden."
+                    )
+                    time.sleep(delay)
+                    continue
+                body = (response.text or "")[:_FORBIDDEN_BODY_SNIPPET_CHARS]
+                raise OmniForbiddenError(
+                    f"GET {path} forbidden (403) again on re-check. body={body!r}",
+                    body=body,
+                )
+
+            if status == 429:
+                # A 429 (or a 5xx below) after a 403 re-check means the host
+                # is genuinely struggling; give a later 403 a fresh re-check.
+                forbidden_rechecked = False
                 if attempt < max_rate_limit_retries:
                     # Honor Retry-After if Omni sends it; else fall back to
                     # jittered exponential backoff.
@@ -345,6 +458,7 @@ class ClientClass:
                         f"retry_after={retry_after!r})."
                     )
                     time.sleep(delay)
+                    attempt += 1
                     continue
                 raise OmniApiError(
                     f"GET {path} rate-limited after retries: {status}",
@@ -353,9 +467,11 @@ class ClientClass:
                 )
 
             if 500 <= status < 600:
+                forbidden_rechecked = False
                 if attempt < max_server_error_retries:
                     delay = (2**attempt) + random.uniform(0.0, 0.25)
                     time.sleep(delay)
+                    attempt += 1
                     continue
                 raise OmniApiError(
                     f"GET {path} failed after server retries: {status}",
@@ -368,8 +484,6 @@ class ClientClass:
                 status_code=status,
                 retryable=False,
             )
-
-        raise OmniApiError(f"GET {path} failed unexpectedly.", retryable=True)
 
     def list_connections(self) -> list[dict[str, Any]]:
         data = self._get_json("/v1/connections")
@@ -528,13 +642,24 @@ class ClientClass:
         model_id = model.get("id")
         if not model_id:
             return []
-        try:
-            payload = self.get_model_yaml(model_id, mode="combined")
-        except Exception as exc:
-            self._swallow("model_yaml", f"model_id={model_id}", exc)
+        kind = str(model.get("modelKind") or "").upper()
+        if kind == "SHARED":
+            # Single-flight with the lazy path in `_shared_topic_hashes_for`:
+            # under this model's own lock, either an inheriting model already
+            # pulled the YAML (take it), or fetch it here — never both.
+            with self._shared_yaml_lock_for(str(model_id)):
+                with self._shared_topic_hashes_lock:
+                    payload = self._prefetched_yaml.pop(model_id, None)
+                if payload is None:
+                    payload = self._fetch_model_yaml_or_swallow(model_id)
+                    self._record_shared_topic_hashes(
+                        str(model_id), (payload or {}).get("files", {}) or {}
+                    )
+        else:
+            payload = self._fetch_model_yaml_or_swallow(model_id)
+        if payload is None:
             return []
 
-        kind = str(model.get("modelKind") or "").upper()
         base_model_id = model.get("baseModelId")
         is_workbook = kind == "WORKBOOK" and bool(base_model_id)
         # The override probe is genuinely workbook-only: `mode=extension` is a
@@ -603,7 +728,15 @@ class ClientClass:
             # silently dropped.
             detail = (
                 self._topic_detail_from_views(
-                    parsed, topic["baseViewName"], views, view_aliases
+                    parsed,
+                    topic["baseViewName"],
+                    views,
+                    view_aliases,
+                    context=(
+                        f"owning_model_id={owning_model_id} model_id={model_id} "
+                        f"topic={topic_name}"
+                    ),
+                    dedupe_key=(owning_model_id, topic_name),
                 )
                 if views
                 else None
@@ -621,11 +754,133 @@ class ClientClass:
                 # turn it into {} — silently dropping source lineage and
                 # dimension/measure names with the run still reporting success.
                 # Retry against the model itself; costs a request only on miss.
+                #
+                # Unless the miss provably cannot help: when the owner's API
+                # answered a confirmed 404 for this topic AND this model's
+                # `.topic` file is byte-identical to the owner's, the model is
+                # asking Omni to compile the same broken definition — it 404s
+                # too. One measured crawl spent ~65% of its budget on exactly
+                # that pair of 404s, once per inheriting model. A file the owner
+                # lacks, or one whose content differs (BRANCH / extension-
+                # defined), still gets the retry.
                 if not detail and owning_model_id != model_id:
-                    detail = self._fetch_topic_detail_cached(model_id, topic_name)
+                    if self._probe_b_cannot_help(
+                        owning_model_id, topic_name, stem, file_content
+                    ):
+                        self._stats["topic_detail_probe_b_skipped"] += 1
+                    else:
+                        detail = self._fetch_topic_detail_cached(model_id, topic_name)
             topic.update(detail)
             topics.append(topic)
         return topics
+
+    @staticmethod
+    def _topic_file_hashes(files: dict[str, Any]) -> dict[str, str]:
+        """{topic stem: sha1(content)} for every `.topic` file in a YAML payload."""
+        hashes: dict[str, str] = {}
+        for file_name, file_content in files.items():
+            if not file_name.endswith(".topic"):
+                continue
+            stem = file_name.removesuffix(".topic").split("/")[-1]
+            hashes[stem] = hashlib.sha1(str(file_content).encode("utf-8")).hexdigest()
+        return hashes
+
+    def _fetch_model_yaml_or_swallow(self, model_id: str) -> dict[str, Any] | None:
+        """Combined YAML for a model, or None with the failure tallied.
+
+        A forbidden model (403 that survived its re-check) is not a crawl
+        defect and not retryable, so it is tallied as `model_yaml_forbidden`,
+        apart from `model_yaml` (which feeds the 20% abort threshold), and
+        logged once with the body so the operator can see what Omni said.
+        Whether the run as a whole has too many is judged in fetch_snapshot.
+        """
+        try:
+            return self.get_model_yaml(model_id, mode="combined")
+        except OmniForbiddenError as exc:
+            self._failures["model_yaml_forbidden"] += 1
+            self._forbidden_model_ids.append(str(model_id))
+            logger.warning(
+                f"omni model YAML forbidden (model_id={model_id}): 403 again on "
+                f"re-check; skipping this model's topics. Not counted toward the "
+                f"model-YAML abort threshold. body={exc.body!r}"
+            )
+            return None
+        except Exception as exc:
+            self._swallow("model_yaml", f"model_id={model_id}", exc)
+            return None
+
+    def _shared_yaml_lock_for(self, model_id: str) -> threading.Lock:
+        with self._shared_topic_hashes_lock:
+            lock = self._shared_yaml_locks.get(model_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._shared_yaml_locks[model_id] = lock
+            return lock
+
+    def _record_shared_topic_hashes(self, model_id: str, files: dict[str, Any]) -> None:
+        with self._shared_topic_hashes_lock:
+            self._shared_topic_hashes.setdefault(model_id, self._topic_file_hashes(files))
+
+    def _shared_topic_hashes_for(self, owner_id: str) -> dict[str, str] | None:
+        """Topic-file hashes of a SHARED owner, fetching its YAML once if needed.
+
+        The pool submits SHARED models first, so this is normally a cache hit.
+        When an inheriting model gets ahead of its owner, the owner's combined
+        YAML is fetched here — under the owner's single-flight lock, so the
+        owner's own `_fetch_topics_for_model` can never have the same request
+        in flight — and parked in `_prefetched_yaml` for that pass to consume.
+        The owner therefore costs exactly one request whichever side wins.
+        Returns None when the owner's YAML cannot be read (and memoizes that,
+        so N inheriting models do not re-fetch a failing owner) — the caller
+        then keeps the retry, because "unknown" must not be mistaken for "same".
+        """
+        with self._shared_topic_hashes_lock:
+            known = self._shared_topic_hashes.get(owner_id)
+        if known is not None:
+            return known
+        with self._shared_yaml_lock_for(owner_id):
+            with self._shared_topic_hashes_lock:
+                known = self._shared_topic_hashes.get(owner_id)
+            if known is not None:
+                return known  # the owner's own pass landed while we waited
+            try:
+                payload = self.get_model_yaml(owner_id, mode="combined")
+            except Exception as exc:
+                logger.warning(
+                    f"omni owner YAML not readable for topic-hash comparison "
+                    f"(owner_model_id={owner_id}): {exc!r}; keeping per-model probe."
+                )
+                self._record_shared_topic_hashes(owner_id, {})
+                return None
+            files = payload.get("files", {}) or {}
+            with self._shared_topic_hashes_lock:
+                self._shared_topic_hashes[owner_id] = self._topic_file_hashes(files)
+                self._prefetched_yaml[owner_id] = payload
+                return self._shared_topic_hashes[owner_id]
+
+    def _probe_b_cannot_help(
+        self, owning_model_id: str, topic_name: str, stem: str, file_content: Any
+    ) -> bool:
+        """True only when a per-model topic probe would provably 404 as well.
+
+        Requires BOTH: the owner's probe was a confirmed 404 (not a transient
+        failure), and this model's `.topic` file is byte-identical to the
+        owner's. Anything short of that keeps the probe.
+        """
+        with self._topic_detail_cache_lock:
+            owner_404 = (owning_model_id, topic_name) in self._topic_detail_not_found
+        if not owner_404:
+            return False
+        owner_hashes = self._shared_topic_hashes_for(owning_model_id)
+        if not owner_hashes or stem not in owner_hashes:
+            return False
+        own_hash = hashlib.sha1(str(file_content).encode("utf-8")).hexdigest()
+        # Assumption: an identical `.topic` file compiles identically. An
+        # extension layer could in principle add a `.view` the topic needs,
+        # but local derivation from the model's own `.view` files is tried
+        # first — the only way to reach this line is for THAT to have failed
+        # too — so the definition is broken in the same way on both sides.
+        return owner_hashes[stem] == own_hash
 
     @staticmethod
     def _view_aliases_from_payload(files: dict[str, Any]) -> dict[str, str]:
@@ -825,12 +1080,19 @@ class ClientClass:
         base_view_name: str | None,
         views: dict[str, dict[str, Any]],
         view_aliases: dict[str, str] | None = None,
+        context: str = "",
+        dedupe_key: tuple[Any, ...] | None = None,
     ) -> dict[str, Any] | None:
         """Build `_fetch_topic_detail`'s exact output shape from local `.view` data.
 
         Returns None when the topic's joins cannot be read, OR when any view the
         topic references cannot be resolved from the payload — so the caller
-        falls back to the HTTP call for that topic alone.
+        falls back to the HTTP call for that topic alone. When `context` is
+        given (the caller's model/topic), the unresolved view names are logged
+        at WARNING, because that fallback is the single most expensive thing a
+        crawl does and the worker log previously never said which view caused it.
+        With `dedupe_key` (owning model, topic) the warning is emitted once per
+        (key, unresolved names) per run rather than once per inheriting model.
 
         The unresolvable-name case is not hypothetical: `joins` uses the
         RELATIONSHIP'S ALIAS where a relationship is aliased, not the underlying
@@ -849,6 +1111,7 @@ class ClientClass:
         """
         joined = self._joined_view_names(parsed_topic)
         if joined is None:
+            self._warn_unresolved(context, dedupe_key, ("<unrecognized joins shape>",))
             return None
         # Base view first, then joins, each view once. The base view is normally
         # also listed in `joins` (it is "included in the topic"), and the topic
@@ -860,14 +1123,19 @@ class ClientClass:
                 ordered.append(name)
         aliases = view_aliases or {}
         view_sources: list[dict[str, Any]] = []
+        unresolved = [
+            name for name in ordered
+            if not isinstance(_resolve_view(views, aliases, name), dict)
+        ]
+        if unresolved:
+            # Still unresolvable — an alias we could not map, or a view absent
+            # from the payload. Give up on local derivation for this topic so
+            # the caller fetches complete detail from the API, rather than
+            # emitting lineage that is silently missing a table.
+            self._warn_unresolved(context, dedupe_key, tuple(unresolved))
+            return None
         for view_name in ordered:
             view = _resolve_view(views, aliases, view_name)
-            if not isinstance(view, dict):
-                # Still unresolvable — an alias we could not map, or a view absent
-                # from the payload. Give up on local derivation for this topic so
-                # the caller fetches complete detail from the API, rather than
-                # emitting lineage that is silently missing a table.
-                return None
             # A view we DID resolve but that carries no `table_name` is legitimate
             # (a derived view with no physical table); skip it, do not fall back.
             table_name = view.get("table_name")
@@ -894,14 +1162,39 @@ class ClientClass:
             "viewSources": view_sources,
         }
 
+    def _warn_unresolved(
+        self,
+        context: str,
+        dedupe_key: tuple[Any, ...] | None,
+        unresolved: tuple[str, ...],
+    ) -> None:
+        """WARN that a topic fell back to the API, once per (owner, topic, names)."""
+        if not context:
+            return
+        if dedupe_key is not None:
+            key = (*dedupe_key, unresolved)
+            with self._topic_detail_cache_lock:
+                if key in self._unresolved_views_logged:
+                    return
+                self._unresolved_views_logged.add(key)
+                self._stats["topic_unresolved_views"] += 1
+        logger.warning(
+            f"topic detail not derivable locally {context}: unresolved view(s) "
+            f"{list(unresolved)}; falling back to the topic API."
+        )
+
     def _fetch_topic_detail_cached(
         self, owning_model_id: str, topic_name: str
     ) -> dict[str, Any]:
         """Memoized `_fetch_topic_detail`, keyed on the OWNING model.
 
-        Only successful (non-empty) results are cached: caching `{}` would let
-        one transient failure permanently blank that topic for every workbook
-        in the run, which is a worse trade than re-attempting it.
+        Successful (non-empty) results are cached. So is a CONFIRMED 404 —
+        as `{}`, the same value the swallow returns — because a 404 is Omni
+        saying it cannot compile that topic, which no retry changes; one
+        measured crawl re-issued that 404 once per inheriting model. Any other
+        failure is NOT cached: caching `{}` for a transient error would let it
+        permanently blank that topic for every workbook in the run, which is a
+        worse trade than re-attempting it.
 
         A benign race can let two threads fetch the same key concurrently; the
         lock is not held across the request, because doing so would serialise
@@ -913,9 +1206,12 @@ class ClientClass:
         if hit is not None:
             return hit
         detail = self._fetch_topic_detail(owning_model_id, topic_name)
-        if detail:
-            with self._topic_detail_cache_lock:
+        with self._topic_detail_cache_lock:
+            if detail:
                 self._topic_detail_cache[key] = detail
+            elif key in self._topic_detail_not_found:
+                self._topic_detail_cache[key] = {}
+                self._stats["topic_detail_404_keys_cached"] += 1
         return detail
 
     def _fetch_topic_detail(self, model_id: str, topic_name: str) -> dict[str, Any]:
@@ -925,9 +1221,23 @@ class ClientClass:
         - base view's `table_name` / `schema` / `catalog` for source lineage
         - names of joined views (excluding the base view)
         - fully-qualified dimension and measure names across all included views
+
+        A 404 is additionally recorded in `_topic_detail_not_found` so the
+        cache can tell "Omni cannot compile this topic" apart from a transient
+        failure (only the former is safe to memoize).
         """
         try:
             payload = self.get_topic(model_id, topic_name)
+        except NonRetryableOmniApiError as exc:
+            if exc.status_code == 404:
+                with self._topic_detail_cache_lock:
+                    self._topic_detail_not_found.add((model_id, topic_name))
+            self._swallow(
+                "topic_detail",
+                f"model_id={model_id} topic={topic_name}",
+                exc,
+            )
+            return {}
         except Exception as exc:
             self._swallow(
                 "topic_detail",
@@ -1086,7 +1396,14 @@ class ClientClass:
         self._abort = abort
         # Reset per-run failure counters.
         self._failures = {k: 0 for k in _FAILURE_CATEGORIES}
+        self._stats = {k: 0 for k in _STATS_CATEGORIES}
         self._topic_detail_cache = {}
+        self._topic_detail_not_found = set()
+        self._shared_topic_hashes = {}
+        self._shared_yaml_locks = {}
+        self._prefetched_yaml = {}
+        self._unresolved_views_logged = set()
+        self._forbidden_model_ids = []
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
@@ -1182,6 +1499,13 @@ class ClientClass:
             f"models ({len(models) - len(topic_models)} content-less workbooks skipped)"
         )
 
+        # SHARED models first (stable: relative order otherwise unchanged), so
+        # their topic-file hashes are normally in hand by the time the models
+        # that inherit from them ask (see `_shared_topic_hashes_for`).
+        topic_models.sort(
+            key=lambda m: str(m.get("modelKind") or "").upper() != "SHARED"
+        )
+
         topics: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
             model_futures = {
@@ -1202,8 +1526,15 @@ class ClientClass:
                         f"fetch_snapshot progress: models {done_models}/{total_models}, "
                         f"topics_so_far={len(topics)}, "
                         f"topic_detail_cached={len(self._topic_detail_cache)}, "
+                        f"topic_detail_404_keys_cached="
+                        f"{self._stats['topic_detail_404_keys_cached']}, "
+                        f"topic_detail_probe_b_skipped="
+                        f"{self._stats['topic_detail_probe_b_skipped']}, "
+                        f"topic_unresolved_views="
+                        f"{self._stats['topic_unresolved_views']}, "
                         f"failures={{"
                         f"model_yaml={self._failures['model_yaml']}, "
+                        f"model_yaml_forbidden={self._failures['model_yaml_forbidden']}, "
                         f"topic_detail={self._failures['topic_detail']}, "
                         f"document_detail={self._failures['document_detail']}}}"
                     )
@@ -1228,10 +1559,46 @@ class ClientClass:
         logger.info(
             f"fetch_snapshot failures: "
             f"model_yaml={self._failures['model_yaml']}/{total_models} "
+            f"model_yaml_forbidden={self._failures['model_yaml_forbidden']} "
             f"override_probe={self._failures['override_probe']} "
             f"topic_detail={self._failures['topic_detail']} "
-            f"document_detail={self._failures['document_detail']}/{len(documents)}"
+            f"document_detail={self._failures['document_detail']}/{len(documents)} "
+            f"stats: "
+            f"topic_detail_404_keys_cached={self._stats['topic_detail_404_keys_cached']} "
+            f"topic_detail_probe_b_skipped="
+            f"{self._stats['topic_detail_probe_b_skipped']} "
+            f"topic_unresolved_views={self._stats['topic_unresolved_views']}"
         )
+        # Forbidden models are judged as a share of the pass, not per request:
+        # a third of the estate answering 403 after a re-check is rate limiting
+        # (Omni answers bursts with 403) or a bad token, not permissions.
+        # Two triggers: the ratio once a minimum sample is in, OR every model
+        # forbidden regardless of sample size — a small estate where the token
+        # can read nothing must not complete with zero topics and report
+        # success (0.4.1 would have aborted it via the model_yaml threshold).
+        forbidden = self._failures.get("model_yaml_forbidden", 0)
+        if total_models > 0 and (
+            forbidden == total_models
+            or (
+                total_models >= _FORBIDDEN_ABORT_MIN_MODELS
+                and forbidden / total_models > _FORBIDDEN_ABORT_RATIO
+            )
+        ):
+            raise OmniApiError(
+                f"{forbidden} of {total_models} models returned 403 even after a "
+                f"recheck ({forbidden / total_models:.0%} > "
+                f"{_FORBIDDEN_ABORT_RATIO:.0%}) — this looks like rate limiting "
+                f"or a token problem, not per-model permissions; lower "
+                f"rate_limit_rpm or check the token. Aborting before transform.",
+                retryable=True,
+            )
+        if self._forbidden_model_ids:
+            logger.warning(
+                f"fetch_snapshot: {len(self._forbidden_model_ids)} model(s) "
+                f"returned 403 for their YAML and were skipped (token scope): "
+                f"{self._forbidden_model_ids[:20]}"
+                f"{' ...' if len(self._forbidden_model_ids) > 20 else ''}"
+            )
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))
