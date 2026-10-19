@@ -36,6 +36,16 @@ _FORBIDDEN_RECHECK_SECONDS = 5.0
 _FORBIDDEN_RECHECK_JITTER_SECONDS = 2.0
 _FORBIDDEN_BODY_SNIPPET_CHARS = 200
 
+# A 403 whose body matches one of these substrings (case-insensitive) is Omni
+# saying the token does not have access to this specific resource — not a
+# burst. Those never clear on retry, so we skip the recheck. One measured
+# large-tenant run burned ~3.1h re-checking 2,800 confirmed per-model perms
+# denials at 30 req/min before the 30% rule aborted. Match is substring, not
+# exact-equals, so a minor message tweak doesn't suddenly re-add the recheck.
+_FORBIDDEN_PERMANENT_BODY_MARKERS = (
+    "you do not have permission",
+)
+
 
 class _RateLimiter:
     """Thread-safe minimum-interval gate. With rpm=60 calls are spaced ≥1s apart."""
@@ -185,6 +195,12 @@ _STATS_CATEGORIES = (
     "topic_detail_404_keys_cached",
     "topic_detail_probe_b_skipped",
     "topic_unresolved_views",
+    # yaml.safe_load calls skipped because an identical byte-for-byte file
+    # was already parsed this run. On a tenant where every workbook carries
+    # byte-identical copies of its shared model's .topic / .view files
+    # (measured: 390,313 topic parses across 6,163 models, one full CPU core
+    # for 7h20m) this is the parse-hot path.
+    "yaml_parse_cache_hits",
 )
 
 # If more than this share of the models attempted in the model pass answered
@@ -281,8 +297,49 @@ class ClientClass:
         self._unresolved_views_logged: set[tuple[Any, ...]] = set()
         # Model ids whose YAML the token cannot read (confirmed 403).
         self._forbidden_model_ids: list[str] = []
+        # sha1(file content) -> parsed yaml. On tenants where workbooks carry
+        # byte-identical copies of their shared model's .topic / .view files,
+        # yaml.safe_load dominated the model pass (one measured run: 390k
+        # topics parsed across 6,163 models in 7h20m, one full CPU core).
+        # Same bytes always parse to the same object, so a hash key is safe.
+        # None means "parse failed" (yaml.YAMLError) — memoized so we don't
+        # re-raise and swallow repeatedly on identical junk.
+        self._yaml_parse_cache: dict[str, Any] = {}
+        self._yaml_parse_cache_lock = threading.Lock()
         if credentials:
             self.load_credentials(credentials)
+
+    def _parse_yaml_cached(self, file_content: Any) -> Any:
+        """yaml.safe_load, memoized on sha1(file_content) per run.
+
+        Returns the parsed value, or None on a YAML parse error (same
+        shape as the pre-cache code's `continue`-on-YAMLError). Non-string
+        / non-bytes input bypasses the cache and goes straight through.
+        """
+        if not isinstance(file_content, (str, bytes)):
+            try:
+                return yaml.safe_load(file_content)
+            except yaml.YAMLError:
+                return None
+        payload_bytes = (
+            file_content.encode("utf-8")
+            if isinstance(file_content, str)
+            else file_content
+        )
+        key = hashlib.sha1(payload_bytes).hexdigest()
+        with self._yaml_parse_cache_lock:
+            if key in self._yaml_parse_cache:
+                self._stats["yaml_parse_cache_hits"] = (
+                    self._stats.get("yaml_parse_cache_hits", 0) + 1
+                )
+                return self._yaml_parse_cache[key]
+        try:
+            parsed = yaml.safe_load(file_content)
+        except yaml.YAMLError:
+            parsed = None
+        with self._yaml_parse_cache_lock:
+            self._yaml_parse_cache[key] = parsed
+        return parsed
 
     def _swallow(self, category: str, context: str, exc: BaseException) -> None:
         """Record + log a silently-caught error so it isn't invisible.
@@ -413,26 +470,42 @@ class ClientClass:
                 return data
 
             # Omni answers a rapid burst with 403 "Invalid bearer token", not
-            # 429. But a 403 on a model the token cannot read never clears,
-            # and retrying it 3x with sleeps is what ate 7-21% of one large
-            # crawl's budget. So a 403 gets ONE re-check after a pause long
-            # enough for a burst to drain; a second 403 is forbidden for this
-            # path — no further retries, non-retryable to the caller. Whether
-            # the RUN is rate-limited is judged on the model pass as a whole
-            # (`_FORBIDDEN_ABORT_RATIO`), where the signal actually lives.
+            # 429. But a 403 on a model the token cannot read never clears.
+            # Two code paths now, keyed on the body:
+            #   - "You do not have permission" / other known-permanent markers
+            #     -> skip the recheck, raise OmniForbiddenError immediately.
+            #     That is per-model permissions, which no retry fixes. One run
+            #     burned ~3.1h re-checking 2,800 of these before the abort
+            #     rule fired.
+            #   - anything else (incl. "Invalid bearer token") -> one recheck
+            #     after 5-7s, exactly as before, so a genuine burst still
+            #     recovers.
+            # The RUN-level judgement (whole model pass is forbidden) is kept
+            # at `_FORBIDDEN_ABORT_MIN_MODELS`, see below.
             if status == 403:
+                body = (response.text or "")[:_FORBIDDEN_BODY_SNIPPET_CHARS]
+                body_lower = body.lower()
+                is_permanent = any(
+                    marker in body_lower
+                    for marker in _FORBIDDEN_PERMANENT_BODY_MARKERS
+                )
+                if is_permanent:
+                    raise OmniForbiddenError(
+                        f"GET {path} forbidden (403). body={body!r}",
+                        body=body,
+                    )
                 if not forbidden_rechecked:
                     forbidden_rechecked = True
                     delay = _FORBIDDEN_RECHECK_SECONDS + random.uniform(
                         0.0, _FORBIDDEN_RECHECK_JITTER_SECONDS
                     )
                     logger.info(
-                        f"Omni 403 for {path}; re-checking once in {delay:.1f}s "
-                        f"before treating it as forbidden."
+                        f"Omni 403 for {path} (body not a known-permanent "
+                        f"marker); re-checking once in {delay:.1f}s before "
+                        f"treating it as forbidden."
                     )
                     time.sleep(delay)
                     continue
-                body = (response.text or "")[:_FORBIDDEN_BODY_SNIPPET_CHARS]
                 raise OmniForbiddenError(
                     f"GET {path} forbidden (403) again on re-check. body={body!r}",
                     body=body,
@@ -678,17 +751,18 @@ class ClientClass:
         # The combined-mode payload already contains this model's `.view` files
         # alongside its `.topic` files, so every field the transformer consumes
         # can be derived locally instead of costing one HTTP call per topic.
-        views = self._views_from_payload(files)
+        views = self._views_from_payload(files, parse=self._parse_yaml_cached)
         # Aliases ride in the same payload, so resolve them locally rather than
         # falling back to the topic API for every aliased join.
-        view_aliases = self._view_aliases_from_payload(files)
+        view_aliases = self._view_aliases_from_payload(files, parse=self._parse_yaml_cached)
         for file_name, file_content in files.items():
             if not file_name.endswith(".topic"):
                 continue
-            try:
-                parsed = yaml.safe_load(file_content) or {}
-            except yaml.YAMLError:
+            parsed = self._parse_yaml_cached(file_content)
+            if parsed is None:
                 continue
+            if not isinstance(parsed, dict):
+                parsed = {}
             # Omni topic YAML has no "name" field; derive it from the filename stem.
             # Filenames may include a group prefix (e.g. "COCO_DEMO/podcast_streaming.topic");
             # the topic API only accepts the bare stem without the directory prefix.
@@ -883,7 +957,10 @@ class ClientClass:
         return owner_hashes[stem] == own_hash
 
     @staticmethod
-    def _view_aliases_from_payload(files: dict[str, Any]) -> dict[str, str]:
+    def _view_aliases_from_payload(
+        files: dict[str, Any],
+        parse: Any = None,
+    ) -> dict[str, str]:
         """Map a relationship alias -> the underlying view name.
 
         `joins` names the relationship's ALIAS where one is defined, not the
@@ -919,10 +996,15 @@ class ClientClass:
         for file_name, file_content in files.items():
             if not file_name.endswith(".relationships"):
                 continue
-            try:
-                parsed = yaml.safe_load(file_content) or {}
-            except yaml.YAMLError:
-                continue
+            if parse is None:
+                try:
+                    parsed = yaml.safe_load(file_content)
+                except yaml.YAMLError:
+                    continue
+            else:
+                parsed = parse(file_content)
+            if parsed is None:
+                parsed = {}
             if isinstance(parsed, list):
                 for entry in parsed:
                     _absorb(entry)
@@ -937,8 +1019,18 @@ class ClientClass:
         return aliases
 
     @staticmethod
-    def _views_from_payload(files: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    def _views_from_payload(
+        files: dict[str, Any],
+        parse: Any = None,
+    ) -> dict[str, dict[str, Any]]:
         """Parse the `.view` files carried in a combined-mode YAML payload.
+
+        `parse` is an optional callable `(file_content) -> parsed-or-None`;
+        when omitted the method parses with yaml.safe_load directly, so the
+        existing static-call tests keep working. The instance-method path
+        (`_fetch_topics_for_model`) threads in `self._parse_yaml_cached` so
+        byte-identical copies of the same `.view` file across inheriting
+        workbooks parse once.
 
         Registered under every form a topic may reference the view by, because
         the file key and the reference genuinely differ. Measured against a live
@@ -976,10 +1068,15 @@ class ClientClass:
         for file_name, file_content in files.items():
             if not file_name.endswith(".view"):
                 continue
-            try:
-                parsed = yaml.safe_load(file_content) or {}
-            except yaml.YAMLError:
-                continue
+            if parse is None:
+                try:
+                    parsed = yaml.safe_load(file_content)
+                except yaml.YAMLError:
+                    continue
+            else:
+                parsed = parse(file_content)
+                if parsed is None:
+                    continue
             if not isinstance(parsed, dict):
                 continue
 
@@ -1404,6 +1501,7 @@ class ClientClass:
         self._prefetched_yaml = {}
         self._unresolved_views_logged = set()
         self._forbidden_model_ids = []
+        self._yaml_parse_cache = {}
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
@@ -1569,27 +1667,21 @@ class ClientClass:
             f"{self._stats['topic_detail_probe_b_skipped']} "
             f"topic_unresolved_views={self._stats['topic_unresolved_views']}"
         )
-        # Forbidden models are judged as a share of the pass, not per request:
-        # a third of the estate answering 403 after a re-check is rate limiting
-        # (Omni answers bursts with 403) or a bad token, not permissions.
-        # Two triggers: the ratio once a minimum sample is in, OR every model
-        # forbidden regardless of sample size — a small estate where the token
-        # can read nothing must not complete with zero topics and report
-        # success (0.4.1 would have aborted it via the model_yaml threshold).
+        # Now that 403 "You do not have permission" skips the recheck and the
+        # per-model permissions path is understood (CCI has 2,800 of 6,163
+        # models the token legitimately cannot read), the 30% abort rule is
+        # relaxed: partial-permission crawls complete, and the only remaining
+        # safety net is "every model forbidden" — a small estate whose token
+        # can read NOTHING still must not complete with zero topics and
+        # report success. Atlan's 2026-10-18 feedback asked to remove the
+        # ratio outright; we keep the all-forbidden check as insurance.
         forbidden = self._failures.get("model_yaml_forbidden", 0)
-        if total_models > 0 and (
-            forbidden == total_models
-            or (
-                total_models >= _FORBIDDEN_ABORT_MIN_MODELS
-                and forbidden / total_models > _FORBIDDEN_ABORT_RATIO
-            )
-        ):
+        if total_models > 0 and forbidden == total_models:
             raise OmniApiError(
-                f"{forbidden} of {total_models} models returned 403 even after a "
-                f"recheck ({forbidden / total_models:.0%} > "
-                f"{_FORBIDDEN_ABORT_RATIO:.0%}) — this looks like rate limiting "
-                f"or a token problem, not per-model permissions; lower "
-                f"rate_limit_rpm or check the token. Aborting before transform.",
+                f"all {total_models} models returned 403 — the token cannot "
+                f"read any model's YAML. Check its scope on the Omni org, or "
+                f"lower rate_limit_rpm if this looks like a burst refusal. "
+                f"Aborting before transform.",
                 retryable=True,
             )
         if self._forbidden_model_ids:

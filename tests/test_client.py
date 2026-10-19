@@ -1471,31 +1471,33 @@ def _mock_estate(n_models: int, n_forbidden: int) -> None:
 
 
 @respx.mock
-def test_forbidden_share_above_ratio_aborts_with_a_token_or_rate_limit_message(monkeypatch):
+def test_partial_forbidden_estate_now_completes(monkeypatch):
+    """0.4.3: the 30% ratio-abort was removed. A partial-permission estate
+    (CCI's shape: 2,800 of 6,163 forbidden with the per-model-perms body)
+    now completes with the readable models rather than aborting the run.
+    The only abort check left is "every model forbidden"."""
     from app.client import _FORBIDDEN_ABORT_MIN_MODELS
 
     client = _quiet_client(monkeypatch)
     n = _FORBIDDEN_ABORT_MIN_MODELS + 10
     _mock_estate(n, n_forbidden=n // 3 + 1)  # just over 30%
 
-    with pytest.raises(OmniApiError, match="looks like rate limiting or a token problem") as excinfo:
-        client.fetch_snapshot(max_concurrency=4)
-    assert excinfo.value.retryable is True
-    assert f"{n // 3 + 1} of {n} models returned 403 even after a recheck" in str(excinfo.value)
-    assert "lower rate_limit_rpm or check the token" in str(excinfo.value)
+    snapshot = client.fetch_snapshot(max_concurrency=4)
+    assert len(snapshot["models"]) == n
+    assert client._failures["model_yaml_forbidden"] == n // 3 + 1
     assert client._failures["model_yaml"] == 0, "forbidden must not count as model_yaml"
 
 
 @respx.mock
-def test_every_model_forbidden_aborts_even_below_the_min_sample(monkeypatch):
-    """10 models, all 403 twice: under the 50-model minimum, but a run that can
-    read NOTHING must not complete with zero topics and report success."""
+def test_every_model_forbidden_aborts(monkeypatch):
+    """10 models, all 403 twice: a run that can read NOTHING must not complete
+    with zero topics and report success. The N == M safety net survives."""
     client = _quiet_client(monkeypatch)
     _mock_estate(10, n_forbidden=10)
 
-    with pytest.raises(OmniApiError, match="looks like rate limiting or a token problem") as excinfo:
+    with pytest.raises(OmniApiError, match="all 10 models returned 403") as excinfo:
         client.fetch_snapshot(max_concurrency=4)
-    assert "10 of 10 models returned 403 even after a recheck" in str(excinfo.value)
+    assert "token cannot read any model" in str(excinfo.value)
     assert client._failures["model_yaml_forbidden"] == 10
     assert client._failures["model_yaml"] == 0
 
@@ -1592,3 +1594,225 @@ def test_new_counters_reset_per_run_and_ride_the_progress_line(monkeypatch):
     summary = [m for m in infos if m.startswith("fetch_snapshot failures:")]
     assert summary and "model_yaml_forbidden=0" in summary[0]
     assert "topic_unresolved_views=0" in summary[0]
+
+
+# ---------------------------------------------------------------------------
+# 0.4.3: YAML parse cache (byte-identical files parse once per run)
+# ---------------------------------------------------------------------------
+
+def test_parse_yaml_cached_returns_same_result_without_reparsing(monkeypatch):
+    """Byte-identical input is parsed once; the second call is a cache hit."""
+    import yaml as _yaml
+    client = ClientClass(credentials=CREDS, rpm=0)
+    calls = {"n": 0}
+    real = _yaml.safe_load
+    def counted(s):
+        calls["n"] += 1
+        return real(s)
+    monkeypatch.setattr("app.client.yaml.safe_load", counted)
+
+    body = "label: Orders\nbase_view: orders_view\n"
+    first = client._parse_yaml_cached(body)
+    second = client._parse_yaml_cached(body)
+    assert first == {"label": "Orders", "base_view": "orders_view"}
+    assert second == first
+    assert calls["n"] == 1
+    assert client._stats["yaml_parse_cache_hits"] == 1
+
+
+def test_parse_yaml_cached_differentiates_distinct_content(monkeypatch):
+    """Different bytes bypass the cache even when the parsed value is equal."""
+    import yaml as _yaml
+    client = ClientClass(credentials=CREDS, rpm=0)
+    calls = {"n": 0}
+    real = _yaml.safe_load
+    def counted(s):
+        calls["n"] += 1
+        return real(s)
+    monkeypatch.setattr("app.client.yaml.safe_load", counted)
+
+    client._parse_yaml_cached("a: 1\n")
+    client._parse_yaml_cached("a: 1\nb: 2\n")
+    assert calls["n"] == 2
+    assert client._stats["yaml_parse_cache_hits"] == 0
+
+
+def test_parse_yaml_cached_memoizes_parse_errors(monkeypatch):
+    """A YAMLError is memoized as None — don't re-raise on identical junk."""
+    import yaml as _yaml
+    client = ClientClass(credentials=CREDS, rpm=0)
+    calls = {"n": 0}
+    real = _yaml.safe_load
+    def counted(s):
+        calls["n"] += 1
+        return real(s)
+    monkeypatch.setattr("app.client.yaml.safe_load", counted)
+
+    # Unterminated flow scalar — safe_load raises yaml.YAMLError.
+    junk = "key: [unterminated"
+    assert client._parse_yaml_cached(junk) is None
+    assert client._parse_yaml_cached(junk) is None
+    assert calls["n"] == 1
+
+
+@respx.mock
+def test_parse_yaml_cache_resets_per_run(monkeypatch):
+    """The cache is per-run — fetch_snapshot clears it before each run so a
+    cross-tenant pod running one activity after another doesn't carry state."""
+    client = _quiet_client(monkeypatch)
+    client._yaml_parse_cache["sentinel"] = "stale"
+    client._stats["yaml_parse_cache_hits"] = 999
+    _mock_listings([])
+    client.fetch_snapshot()
+    assert "sentinel" not in client._yaml_parse_cache
+    assert client._stats["yaml_parse_cache_hits"] == 0
+
+
+@respx.mock
+def test_identical_topic_files_across_workbooks_parse_once(monkeypatch):
+    """CCI's hot path: a shared topic inherited verbatim by three workbooks
+    is parsed once, cache hit twice.
+
+    The two workbook models are opt-in to the aggressive filter by appearing
+    in /v1/documents (otherwise they are dropped as content-less and never
+    reach `_fetch_topics_for_model`, which is the parse site)."""
+    client = _quiet_client(monkeypatch)
+    # listings: 3 models and 2 documents whose modelId points at each wb,
+    # so item 4a's filter keeps both wbs.
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [
+                {"id": "shared1", "modelKind": "SHARED"},
+                {"id": "wb1", "name": "WB 1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+                {"id": "wb2", "name": "WB 2", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+            ],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json=_LISTING_EMPTY)
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={
+            "records": [
+                {"identifier": "d1", "name": "D1"},
+                {"identifier": "d2", "name": "D2"},
+            ],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/d1").mock(
+        return_value=httpx.Response(200, json={"modelId": "wb1", "queryPresentations": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents/d2").mock(
+        return_value=httpx.Response(200, json={"modelId": "wb2", "queryPresentations": []})
+    )
+    files = {"orders.topic": _ORDERS_TOPIC}
+    _mock_yaml("shared1", files)
+    _mock_yaml("wb1", files)
+    _mock_yaml("wb1", {}, mode="extension")
+    _mock_yaml("wb2", files)
+    _mock_yaml("wb2", {}, mode="extension")
+    for model_id in ("shared1", "wb1", "wb2"):
+        respx.get(f"https://test.omniapp.co/api/v1/models/{model_id}/topic/orders").mock(
+            return_value=httpx.Response(404)
+        )
+
+    client.fetch_snapshot(max_concurrency=4)
+    # Three parses of _ORDERS_TOPIC would be the pre-cache number; now it's
+    # parsed once and hit at least twice.
+    assert client._stats["yaml_parse_cache_hits"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# 0.4.3: body-text-aware 403 branching
+# ---------------------------------------------------------------------------
+
+@respx.mock
+def test_403_with_permission_denied_body_skips_recheck(monkeypatch):
+    """CCI's shape: body says "You do not have permission..." — not a burst,
+    skip the recheck. One request, OmniForbiddenError raised."""
+    from app.client import OmniForbiddenError
+
+    client = _quiet_client(monkeypatch)
+    route = respx.get(
+        "https://test.omniapp.co/api/v1/models/m1/yaml", params={"mode": "combined"}
+    ).mock(return_value=httpx.Response(
+        403,
+        text='{"detail":"You do not have permission to read the model yaml for model m1","status":403}',
+    ))
+
+    with pytest.raises(OmniForbiddenError) as excinfo:
+        client.get_model_yaml("m1")
+    assert route.call_count == 1, "permanent-marker 403 must not be rechecked"
+    assert "You do not have permission" in excinfo.value.body
+
+
+@respx.mock
+def test_403_with_permission_denied_body_is_case_insensitive(monkeypatch):
+    """Substring match must survive a minor casing tweak on Omni's side."""
+    from app.client import OmniForbiddenError
+    client = _quiet_client(monkeypatch)
+    route = respx.get(
+        "https://test.omniapp.co/api/v1/models/m1/yaml", params={"mode": "combined"}
+    ).mock(return_value=httpx.Response(
+        403, text="YOU DO NOT HAVE PERMISSION to see this",
+    ))
+
+    with pytest.raises(OmniForbiddenError):
+        client.get_model_yaml("m1")
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_403_invalid_bearer_token_still_rechecked(monkeypatch):
+    """The burst-refusal path survives — 'Invalid bearer token' is the body
+    we saw on Peter's org during rate-limit experiments, not permanent."""
+    client = _quiet_client(monkeypatch)
+    _mock_listings([{"id": "m1"}])
+    route = respx.get(
+        "https://test.omniapp.co/api/v1/models/m1/yaml", params={"mode": "combined"}
+    )
+    route.side_effect = [
+        httpx.Response(403, text="Invalid bearer token"),
+        httpx.Response(200, json={"files": {"orders.topic": _ORDERS_TOPIC}}),
+    ]
+    respx.get("https://test.omniapp.co/api/v1/models/m1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    snapshot = client.fetch_snapshot()
+    assert route.call_count == 2
+    assert [t["modelId"] for t in snapshot["topics"]] == ["m1"]
+
+
+@respx.mock
+def test_cci_shape_many_perms_denied_completes_without_recheck(monkeypatch):
+    """CCI's actual shape: 60 models, 30 return the per-model permission body.
+    Each forbidden model costs exactly ONE request (no recheck), the run
+    completes, forbidden_model_ids_total ends at 30."""
+    client = _quiet_client(monkeypatch)
+    models = [{"id": f"m{i:03d}"} for i in range(60)]
+    _mock_listings(models)
+
+    def yaml_handler(request):
+        idx = int(re.search(r"/models/m(\d+)/yaml", str(request.url)).group(1))
+        if idx < 30:
+            return httpx.Response(
+                403,
+                text=f'{{"detail":"You do not have permission to read the model yaml for model m{idx:03d}","status":403}}',
+            )
+        return httpx.Response(200, json={"files": {}})
+
+    yaml_route = respx.get(url__regex=r".*/v1/models/m\d+/yaml.*").mock(side_effect=yaml_handler)
+
+    snapshot = client.fetch_snapshot(max_concurrency=4)
+    assert len(snapshot["models"]) == 60
+    assert client._failures["model_yaml_forbidden"] == 30
+    assert client._failures["model_yaml"] == 0
+    # 30 forbidden x 1 request each + 30 readable x 1 request = 60 total
+    assert yaml_route.call_count == 60, (
+        f"expected 60 YAML calls (no recheck), got {yaml_route.call_count}"
+    )
