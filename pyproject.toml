@@ -1,15 +1,21 @@
 [project]
 name = "omni-connector-app"
-version = "0.4.3"
+version = "0.4.4"
 description = "Atlan custom app for extracting Omni metadata."
 authors = [{ name = "Atlan App Team", email = "connect@atlan.com" }]
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 readme = "README.md"
 dependencies = [
-    "atlan-application-sdk[workflows,tests]==2.3.1",
+    # Pinned to the v2 line (latest release/v2 at bump time: 2.8.7). The v2
+    # line carries the certifi floor Atlan asked for on 2026-10-26 — the new
+    # base image (app-runtime-base:2.8.7-14) ships no Python packages, so
+    # certifi has to come from this repo's lock.
+    "atlan-application-sdk[workflows,tests]>=2.8.7,<3",
     "poethepoet",
-    "pyarrow>=23.0.0",
+    # pyarrow is a transitive dep of atlan-application-sdk; the SDK v2 line
+    # constrains it to <23, so letting the SDK pick avoids a conflict. No
+    # code in this repo imports pyarrow directly.
     "httpx>=0.28.1",
     "pyyaml>=6.0.2",
 ]
