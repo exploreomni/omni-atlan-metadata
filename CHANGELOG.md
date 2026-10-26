@@ -4,6 +4,34 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-10-26
+
+Dependency maintenance from Atlan's 2026-10-26 ask. The new partner base
+image (`registry.atlan.com/public/app-runtime-base:2.8.7-14`) ships no
+Python packages, so the certifi floor has to come from this repo's lock
+or the app still trusts the compromised root. No code changes.
+
+### Changed
+
+- **Base image:** `app-runtime-base:2.8.7-6` → `2.8.7-14`.
+- **SDK:** `atlan-application-sdk 2.3.1` → `2.8.7` (open the pin to
+  `>=2.8.7,<3` to pick up the certifi floor the v2 line carries).
+- **certifi:** `2026.5.20` → `2026.10.23` (above the `>= 2026.10.19`
+  floor Atlan asked for).
+- **dapr:** `1.16.0` → `1.17.4` (transitive via the SDK; see note below).
+- **pyarrow pin removed from `pyproject.toml`.** No code in this repo
+  imports pyarrow directly; the SDK v2 line constrains it to `<23`
+  which conflicts with the previous `>=23.0.0` top-level pin. Let the
+  SDK pick (it resolves to `22.0.0`).
+
+### Note
+
+Atlan's handoff said "the new base moves Dapr to 1.18", but the Python
+dapr dep landed at 1.17.4 (highest the SDK v2 line permits). The 1.18
+reference is almost certainly the Dapr sidecar runtime shipped in the
+base image, not the Python SDK — those are separate. Flagging in the
+reply in case the Python side also needs to be moved.
+
 ## [0.4.3] - 2026-10-19
 
 Follow-on fixes from Atlan's 2026-10-18 review of the first v0.4.2 run on

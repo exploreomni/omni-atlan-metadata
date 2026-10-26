@@ -1,4 +1,4 @@
-FROM registry.atlan.com/public/app-runtime-base:2.8.7-6
+FROM registry.atlan.com/public/app-runtime-base:2.8.7-14
 
 COPY --chown=appuser:appuser pyproject.toml README.md ./
 RUN --mount=type=cache,target=/home/appuser/.cache/uv,uid=1000,gid=1000 \
