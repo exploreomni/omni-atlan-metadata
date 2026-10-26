@@ -4,6 +4,59 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-10-19
+
+Follow-on fixes from Atlan's 2026-10-18 review of the first v0.4.2 run on
+CCI's ~6,200-model tenant. Both attempts failed with
+`2800 of 6163 models returned 403 even after a recheck (45% > 30%)`.
+Analysis of the worker logs showed two separate costs:
+
+- **Parse hotspot (~7h20m):** workbook models carry byte-identical copies
+  of their shared model's `.topic` and `.view` files, and v0.4.2 parsed
+  each copy again. One run parsed 390,313 topics for 6,163 models at one
+  full CPU core continuously.
+- **Permissions handling misclassified:** 2,800 of 6,163 models return
+  `403 "You do not have permission to read the model yaml"` — a fixed
+  per-model permission signal, not a burst. v0.4.2 rechecked each one
+  (an extra 2,800 wasted requests at 30 rpm, ~1.5h) and then the
+  `>30%` abort rule aborted the run before transform.
+
+### Fixed
+
+- **Per-run YAML parse cache.** `_parse_yaml_cached(file_content)` hashes
+  the bytes and memoizes the parsed result. `_fetch_topics_for_model`,
+  `_views_from_payload`, and `_view_aliases_from_payload` all thread the
+  cache in — a byte-identical `.topic` / `.view` file across N inheriting
+  workbooks parses once. `yaml_parse_cache_hits` rides the progress line
+  and summary. Expected impact on CCI's shape: eliminates the parse CPU
+  bottleneck that pushed the model pass to ~1 full core for 7h20m.
+
+- **403 split by response body.** A 403 whose body contains "you do not
+  have permission" (substring, case-insensitive) is per-model permissions
+  and never clears — skip the recheck, raise `OmniForbiddenError`
+  immediately. Any other 403 (notably "Invalid bearer token", the burst
+  signal) keeps the one-recheck-then-forbidden ladder from v0.4.2.
+  Expected impact on CCI: the ~1.5h spent rechecking 2,800 confirmed
+  perms-denied drops to zero.
+
+- **Relaxed the 30% forbidden-abort rule.** Now that per-model perms
+  denials skip the recheck, a partial-permission crawl is the expected
+  shape rather than a signal of a token problem — the rule aborted CCI's
+  legitimate run. The only remaining safety net is "every model
+  forbidden" (`N == M`): if the token can read NOTHING, abort rather
+  than complete with zero topics and report success.
+
+### Added
+
+- Forbidden-model summary surfaces in the activity result as
+  `forbidden_model_ids_sample` (first 50) and `forbidden_model_ids_total`,
+  so a Temporal history reader can scope the token's permissions
+  without scraping worker logs. The full list stays in the WARNING line
+  at end-of-pass.
+- `fetch_stats` on the activity result mirrors the client's `_stats`
+  (cache hits, 404-cache keys, etc.) so request-budget shape lands in
+  Temporal history alongside the failure tallies.
+
 ## [0.4.2] - 2026-10-06
 
 Follow-on fixes from Atlan's review of six v0.4.1 runs on a large customer

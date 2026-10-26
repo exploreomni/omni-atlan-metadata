@@ -277,4 +277,19 @@ class ActivitiesClass(ActivitiesInterface):
             # go unnoticed in Temporal history. Defensive .get: an older
             # ClientClass without _failures still returns {}.
             "fetch_failures": dict(getattr(run_client, "_failures", {})),
+            # Per-run stats (parse-cache hits, 404 cache keys, etc.). Rides
+            # the activity result so a Temporal history reader doesn't need
+            # the worker log to see the request-budget breakdown.
+            "fetch_stats": dict(getattr(run_client, "_stats", {})),
+            # Up to the first 50 model ids whose YAML the token could not
+            # read. Lets a reviewer scope the token's permissions without
+            # scraping worker logs. The full list stays only in the WARNING
+            # line at end-of-pass — surfacing all of them here on a tenant
+            # with ~2,800 forbidden would blow out the activity result size.
+            "forbidden_model_ids_sample": list(
+                getattr(run_client, "_forbidden_model_ids", []) or []
+            )[:50],
+            "forbidden_model_ids_total": len(
+                getattr(run_client, "_forbidden_model_ids", []) or []
+            ),
         }
