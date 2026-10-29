@@ -1,0 +1,1311 @@
+# Upgrade Guide: v2 → v3
+
+Application SDK v3.0 introduces three major improvements:
+
+1. **Schema-driven contracts** — typed `Input`/`Output` Pydantic models replace `Dict[str, Any]`
+2. **Infrastructure abstraction** — Protocol-based interfaces decouple services from Dapr
+3. **Temporal abstraction** — `App` + `@task` replace `@workflow.defn` + `@activity.defn`
+
+> **Current version: 3.5.0.** This guide covers the v2 → v3.0 migration steps. For additions since v3.0, see the callout below.
+
+> **Added since v3.0** (highlights for connectors upgrading incrementally):
+>
+> - **v3.1** — `[sql]` extra split; `[azure]` and `[distributed_lock]` extras lazy-loaded so importing core symbols (`App`, `BaseSQLClient`) never pulls optional deps.
+> - **v3.2** — `OAuthTokenService` promoted to public API (`from application_sdk.credentials import OAuthTokenService`).
+> - **v3.4** — `get_logger` and `AtlanLoggerAdapter` (including `.opt()`) exposed as top-level public API (`from application_sdk.observability import get_logger`).
+> - **v3.5** — `mcp_tool` / `MCPServer` lazy-loaded; `clients/__init__` lazy-loads `AzureClient`, `RedisClient`, `RedisClientAsync`.
+
+v3.0 is a clean break from v2. All v2 Python module paths raise `ImportError` — update all imports to their v3 equivalents using the quick reference below. A set of environment-variable aliases remain to ease the infrastructure rollout (e.g. Helm charts that still set `ATLAN_WORKFLOW_HOST` or `APPLICATION_MODE`) — see [Configuration](configuration.md) for the full alias list. One legacy helper, `application_sdk.common.error_codes`, is retained for back-compat; prefer `application_sdk.errors` for new code.
+
+> **Shipping an app?** Run through [`standards/v3-readiness.md`](standards/v3-readiness.md) before declaring the upgrade complete — it's the sign-off checklist for app owners and reviewers.
+
+---
+
+## Quick Reference
+
+| v2 | v3 |
+|---|---|
+| `from application_sdk.workflows import WorkflowInterface` | `from application_sdk.app import App` |
+| `from application_sdk.activities import ActivitiesInterface` | `from application_sdk.app import task` |
+| `from application_sdk.handlers import HandlerInterface` | `from application_sdk.handler import Handler` |
+| `from application_sdk.worker import Worker` | `from application_sdk.execution import create_worker` |
+| `from application_sdk.application import BaseApplication` | `from application_sdk.main import run_dev_combined` |
+| `from application_sdk.workflows.metadata_extraction.sql import BaseSQLMetadataExtractionWorkflow` | `from application_sdk.templates import SqlMetadataExtractor` |
+| `from application_sdk.workflows.metadata_extraction.incremental_sql import IncrementalSQLMetadataExtractionWorkflow` | `from application_sdk.templates import IncrementalSqlMetadataExtractor` |
+| `from application_sdk.workflows.query_extraction.sql import SQLQueryExtractionWorkflow` | `from application_sdk.templates import SqlQueryExtractor` |
+| `from application_sdk.services.objectstore import ObjectStore` | `from application_sdk.storage import upload_file, download_file` |
+| `from application_sdk.services.secretstore import SecretStore` | `from application_sdk.infrastructure import SecretStore` |
+| `from application_sdk.services.statestore import StateStore` | `from application_sdk.infrastructure import StateStore` |
+| `from application_sdk.clients.atlan import get_async_client` | `from application_sdk.credentials import create_async_atlan_client` |
+| `from application_sdk.activities.common.models import ActivityStatistics` | `from application_sdk.common.models import TaskStatistics` |
+| `from application_sdk.test_utils.credentials import MockCredentialStore` | `from application_sdk.testing import MockCredentialStore` |
+
+---
+
+## Dependency Profiles
+
+Starting with v3.1.0, `duckdb`, `duckdb-engine`, `pandas`, and `pyarrow` (~300 MiB) are
+**removed from core** and moved to an optional `[sql]` extra. `dapr`, `temporalio`, and
+`orjson` are **promoted to core** (they were already eagerly imported by every app).
+
+The `[workflows]` extra is a backwards-compatibility shim — the packages it pins (`temporalio`, `orjson`) are already promoted to core in v3.1 so the extra is functionally redundant. Keep it only if your install tooling requires it.
+
+### The `[daft]` extra
+
+`[daft]` is **deprecated and will be removed in v4.0.0**. Move to `[sql]` (or
+`[incremental]` if you use the incremental analytics stack).
+
+It is an alias for `[sql]`, so a pin on `atlan-application-sdk[daft]` resolves
+the same packages it did before v3.22 and nothing breaks while you migrate.
+
+If you are on **v3.22 through v3.27**, upgrade: over that range the extra
+resolved to nothing. That is a silent break rather than a loud one — imports
+still succeed and mocked unit tests still pass, so the first symptom is
+`ImportError: duckdb is required for DuckDBConnectionManager` on the first real
+transform, end-to-end. A version bump is the whole fix; no per-repo change is
+needed. The D010 conformance rule covers the residual case of an app on plain
+`atlan-application-sdk` with no extras at all.
+
+### Install by app type
+
+| App type | Install command |
+|----------|----------------|
+| Custom `App` / `BaseMetadataExtractor` (API-based) | `pip install atlan-application-sdk` |
+| `SqlMetadataExtractor` / `SqlQueryExtractor` | `pip install atlan-application-sdk[sql]` |
+| `IncrementalSqlMetadataExtractor` | `pip install atlan-application-sdk[incremental]` |
+
+### Dockerfile examples
+
+**API-based connector (no SQL deps needed):**
+
+```dockerfile
+FROM registry.atlan.com/public/app-runtime-base:3
+# ... (see Dockerfile for full setup)
+RUN uv pip install atlan-application-sdk
+ENV ATLAN_APP_MODULE=app.app:MyOpenApiApp
+```
+
+**SQL connector:**
+
+```dockerfile
+FROM registry.atlan.com/public/app-runtime-base:3
+RUN uv pip install "atlan-application-sdk[sql]"
+ENV ATLAN_APP_MODULE=app.app:MyDatabaseConnector
+```
+
+**Incremental SQL connector:**
+
+```dockerfile
+FROM registry.atlan.com/public/app-runtime-base:3
+RUN uv pip install "atlan-application-sdk[incremental]"
+ENV ATLAN_APP_MODULE=app.app:MyIncrementalConnector
+```
+
+---
+
+## Step 1: Upgrade SQL Metadata Extraction
+
+### v2
+
+```python
+from application_sdk.workflows.metadata_extraction.sql import BaseSQLMetadataExtractionWorkflow
+from application_sdk.activities.metadata_extraction.sql import BaseSQLMetadataExtractionActivities
+
+@workflow.defn
+class MyMetadataWorkflow(BaseSQLMetadataExtractionWorkflow):
+    activities_cls = MyMetadataActivities
+
+class MyMetadataActivities(BaseSQLMetadataExtractionActivities):
+    async def fetch_databases(self, workflow_args: Dict[str, Any]) -> ActivityStatistics:
+        # fetch databases
+        return ActivityStatistics(chunk_count=1, total_record_count=10)
+```
+
+### v3
+
+```python
+from application_sdk.templates import SqlMetadataExtractor
+from application_sdk.templates.contracts import (
+    FetchDatabasesInput, FetchDatabasesOutput,
+    ExtractionInput, ExtractionOutput,
+)
+from application_sdk.app import task
+
+class MyMetadataExtractor(SqlMetadataExtractor):
+    @task(timeout_seconds=1800)
+    async def fetch_databases(self, input: FetchDatabasesInput) -> FetchDatabasesOutput:
+        # fetch databases
+        return FetchDatabasesOutput(chunk_count=1, total_record_count=10)
+```
+
+Key changes:
+- Single class instead of workflow + activities split
+- Typed `Input`/`Output` Pydantic models instead of `Dict[str, Any]`
+- `@task` decorator instead of `@activity.defn` + manual `execute_activity_method`
+- Override `run()` to customize orchestration (default: parallel fetch of all metadata types)
+
+---
+
+## Step 2: Upgrade SQL Query Extraction
+
+### v2
+
+```python
+from application_sdk.workflows.query_extraction.sql import SQLQueryExtractionWorkflow
+from application_sdk.activities.query_extraction.sql import SQLQueryExtractionActivities
+
+@workflow.defn
+class MyQueryWorkflow(SQLQueryExtractionWorkflow):
+    activities_cls = MyQueryActivities
+```
+
+### v3
+
+```python
+from application_sdk.templates import SqlQueryExtractor
+from application_sdk.templates.contracts import (
+    QueryBatchInput, QueryBatchOutput,
+    QueryFetchInput, QueryFetchOutput,
+)
+from application_sdk.app import task
+
+class MyQueryExtractor(SqlQueryExtractor):
+    @task(timeout_seconds=600)
+    async def get_query_batches(self, input: QueryBatchInput) -> QueryBatchOutput:
+        ...
+
+    @task(timeout_seconds=3600)
+    async def fetch_queries(self, input: QueryFetchInput) -> QueryFetchOutput:
+        ...
+```
+
+---
+
+## Step 3: Upgrade Incremental SQL Extraction
+
+### v2
+
+```python
+from application_sdk.workflows.metadata_extraction.incremental_sql import (
+    IncrementalSQLMetadataExtractionWorkflow,
+)
+from application_sdk.activities.metadata_extraction.incremental import (
+    BaseSQLIncrementalMetadataExtractionActivities,
+)
+
+@workflow.defn
+class MyIncrementalWorkflow(IncrementalSQLMetadataExtractionWorkflow):
+    activities_cls = MyIncrementalActivities
+
+class MyIncrementalActivities(BaseSQLIncrementalMetadataExtractionActivities):
+    async def fetch_columns(self, workflow_args: Dict[str, Any]) -> ActivityStatistics:
+        ...
+```
+
+### v3
+
+```python
+from application_sdk.templates import IncrementalSqlMetadataExtractor
+from application_sdk.templates.contracts import (
+    IncrementalExtractionInput, IncrementalExtractionOutput,
+    FetchColumnsIncrementalInput, FetchColumnsOutput,
+)
+from application_sdk.app import task
+
+class MyIncrementalExtractor(IncrementalSqlMetadataExtractor):
+    @task(timeout_seconds=1800)
+    async def fetch_columns(self, input: FetchColumnsIncrementalInput) -> FetchColumnsOutput:
+        ...
+```
+
+`IncrementalSqlMetadataExtractor` runs a 4-phase extraction by default:
+1. Write an incremental marker (current timestamp)
+2. Fetch the current full state into a local DuckDB file
+3. Diff against the previous state and emit only changed rows
+4. Finalize by persisting the new state to object storage
+
+Override `run()` if you need to customise this sequence. The incremental state files are managed by the framework and cleaned up automatically via the cleanup lifecycle.
+
+---
+
+## Step 3b: Upgrade REST/API Extraction (Asset-Mapper Pattern)
+
+If your connector talks to a REST/API backend (rather than a SQL engine), v3 replaces the v2 `TransformerInterface` + Daft + YAML-query pipeline with a simpler pattern: **typed records → pure mapper functions → `pyatlan` Asset instances**. Reference implementations: `atlan-openapi-app`, `atlan-azure-event-hub-app`.
+
+> **Note:** The examples below import from the legacy `pyatlan` package (consistent with the
+> built-in `AtlasTransformer` transformers, which still depend on `pyatlan`). If you are
+> building a new connector that uses the `pyatlan_v9` client elsewhere, prefer
+> `from pyatlan_v9.model.assets import ...` and use the v9 serialisation API instead of
+> `.dict()`.
+
+### When to use this pattern
+
+Use the asset-mapper pattern when:
+
+- Your source is a REST API, SaaS service, or any non-SQL backend.
+- You don't have SQL queries to templatize in YAML.
+- You want typed intermediate records instead of untyped DataFrames.
+
+SQL connectors should continue to use `SqlMetadataExtractor` (Step 1) and the templated-query pattern.
+
+### v2
+
+```python
+# app/transformer.py
+from application_sdk.transformers.atlas import AtlasTransformer
+
+class MyConnectorTransformer(AtlasTransformer):
+    # YAML query files under app/sql/ define the per-entity shape
+    # Daft DataFrames flow through transform → atlas entity emission
+    ...
+```
+
+### v3
+
+Two files replace the transformer subclass:
+
+```python
+# app/api_types.py — typed intermediate records
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class TopicRecord:
+    name: str
+    partition_count: int
+    retention_ms: int
+```
+
+```python
+# app/asset_mapper.py — pure functions, one per entity type
+from pyatlan.model.assets import KafkaTopic
+from app.api_types import TopicRecord
+
+def map_topic(
+    record: TopicRecord,
+    connection_qn: str,
+    connection_name: str,
+) -> KafkaTopic:
+    """Pure function: no I/O, no side effects, deterministic."""
+    return KafkaTopic(
+        qualified_name=f"{connection_qn}/topic/{record.name}",
+        name=record.name,
+        connection_qualified_name=connection_qn,
+        connection_name=connection_name,
+        kafka_partitions=record.partition_count,
+        kafka_topic_retention_time_ms=record.retention_ms,
+    )
+```
+
+Wire them into extract/transform tasks on your `App` subclass:
+
+```python
+# app/app.py
+from application_sdk.app import App, task
+from application_sdk.contracts import Input, Output, FileReference, UploadInput
+from app.api_types import TopicRecord
+from app.asset_mapper import map_topic
+
+class FetchOutput(Output):
+    file: FileReference
+
+class TransformInput(Input):
+    file: FileReference
+
+class TransformOutput(Output):
+    file: FileReference
+
+class MyConnector(App):
+    @task
+    async def extract_topics(self, input: MyInput) -> FetchOutput:
+        records = [TopicRecord(**row) async for row in self.client.list_topics()]
+        local_path = "/tmp/topics.jsonl"
+        write_jsonl(local_path, records)  # your serialisation helper
+        return FetchOutput(file=FileReference.from_local(local_path))  # framework auto-uploads
+
+    @task
+    async def transform_topics(self, input: TransformInput) -> TransformOutput:
+        # framework auto-downloads input.file before this task runs; input.file.local_path is set
+        records = read_jsonl(input.file.local_path, TopicRecord)  # your parse helper
+        assets = [map_topic(r, self.connection_qn, self.connection_name) for r in records]
+        local_path = "/tmp/topics_assets.jsonl"
+        write_jsonl(local_path, assets)  # your serialisation helper
+        return TransformOutput(file=FileReference.from_local(local_path))  # framework auto-uploads
+
+    async def run(self, input: MyInput) -> MyOutput:
+        fetch_out = await self.extract_topics(input)
+        transform_out = await self.transform_topics(TransformInput(file=fetch_out.file))
+
+        # Required explicit hand-off: routes through atlan-objectstore (Atlan-owned) in SDR
+        # so the publish app can read it. The activity interceptor only writes FileReferences
+        # to the customer-owned objectstore (infra.storage). Omitting this call produces a
+        # silent failure in SDR — the DAG succeeds but nothing is published. See ADR-0014.
+        await self.upload(UploadInput(local_path=transform_out.file.local_path))
+        return MyOutput(...)
+```
+
+> **Two-store rule:** `FileReference` + the activity interceptor = **task-to-task** durability,
+> customer-owned `objectstore`. `App.upload()` = **app-to-app** hand-off, Atlan-owned
+> `atlan-objectstore` in SDR. These are two distinct stores. Forgetting `App.upload()` is a
+> silent failure — all activities succeed but Atlan's publish app sees nothing. See
+> [ADR-0014](../adr/0014-two-store-storage-architecture.md) and
+> [file-reference.md](../concepts/file-reference.md).
+
+### Rules for mapper functions
+
+- **Pure functions only** — no I/O, no side effects, deterministic output for the same input. Temporal may replay these during retries.
+- **One function per entity type** — `map_topic`, `map_consumer_group`, `map_process`, etc.
+- **Take a record + context, return an `Asset`** — context (connection QN, tenant ID, workflow IDs) is passed as parameters, not read from globals.
+- **Stamp sync metadata in a helper** — a `_apply_sync_metadata(asset, workflow_id, run_id, tenant_id)` helper keeps sync-stamp logic in one place (see `atlan-azure-event-hub-app/app/asset_mapper.py`).
+
+### What to remove from v2
+
+- `TransformerInterface` subclasses (`AtlasTransformer`, `QueryBasedTransformer`)
+- Daft DataFrame pipelines for REST/API sources
+- `app/sql/*.yaml` query files (these are SQL-only)
+- Custom `transform` methods on Activities classes
+
+The import rewriter (`tools/migrate_v3/rewrite_imports.py`) cannot auto-convert transformer code — it will leave `# TODO(upgrade-v3)` markers so you know where to apply this pattern manually.
+
+---
+
+## Step 4: Upgrade the Handler
+
+### v2
+
+```python
+from application_sdk.handlers import HandlerInterface
+
+class MyHandler(HandlerInterface):
+    async def load(self, *args, **kwargs) -> None: ...
+    async def test_auth(self, *args, **kwargs) -> bool: ...
+    async def preflight_check(self, *args, **kwargs): ...
+    async def fetch_metadata(self, *args, **kwargs): ...
+```
+
+### v3
+
+```python
+from application_sdk.handler import Handler
+from application_sdk.handler.contracts import (
+    AuthInput, AuthOutput, AuthStatus,
+    PreflightInput, PreflightOutput, PreflightStatus,
+    MetadataInput, MetadataOutput,
+)
+
+class MyHandler(Handler):
+    async def test_auth(self, input: AuthInput) -> AuthOutput:
+        # test connection
+        return AuthOutput(status=AuthStatus.SUCCESS)
+
+    async def preflight_check(self, input: PreflightInput) -> PreflightOutput:
+        # run preflight checks
+        return PreflightOutput(status=PreflightStatus.READY)
+
+    async def fetch_metadata(self, input: MetadataInput) -> MetadataOutput:
+        # return connector config
+        return MetadataOutput(objects=[])
+```
+
+The `load()` method is removed — handler context (secrets, state) is injected automatically via `self.context`. Access credentials in handler methods with `await self.context.get_secret(name)`.
+
+---
+
+## Step 5: Upgrade the Application Entry Point
+
+### v2
+
+```python
+from application_sdk.application.metadata_extraction.sql import (
+    BaseSQLMetadataExtractionApplication,
+)
+
+app = BaseSQLMetadataExtractionApplication(
+    name="my-connector",
+    client_class=MyClient,
+    handler_class=MyHandler,
+)
+await app.start()
+```
+
+### v3
+
+**`ATLAN_APP_MODULE` is mandatory in production.** The base image entrypoint hard-fails at
+startup if it is not set. Set it in your app's `Dockerfile` — it should never be left to Helm
+values or runtime defaults.
+
+The base image (`registry.atlan.com/public/app-runtime-base:3`) includes
+the `application-sdk` CLI, Dapr, and the entrypoint. You do **not** need a custom `ENTRYPOINT`
+or `entrypoint.sh`. The base image handles mode selection at runtime:
+
+```dockerfile
+# Application-sdk v3 base image (Chainguard-based)
+FROM registry.atlan.com/public/app-runtime-base:3
+
+WORKDIR /app
+
+# Install dependencies first (better caching)
+COPY --chown=appuser:appuser pyproject.toml uv.lock README.md ./
+RUN --mount=type=cache,target=/home/appuser/.cache/uv,uid=1000,gid=1000 \
+    uv venv .venv && \
+    uv sync --locked --no-install-project
+
+# Copy application code
+COPY --chown=appuser:appuser . .
+
+# App-specific environment variables
+ENV ATLAN_HANDLER_PORT=8000
+ENV ATLAN_APP_MODULE=app.app:MyMetadataExtractor
+ENV ATLAN_CONTRACT_GENERATED_DIR=app/generated
+
+```
+
+`ATLAN_CONTRACT_GENERATED_DIR` tells the SDK where to find the generated contract JSON files
+(configmaps, manifest). Place these files inside your repo's `app/generated/` directory — the
+Pkl contract source (`contract/app.pkl`) outputs there, and `COPY . .` in your Dockerfile
+automatically includes it.
+
+For local dev, pass the class directly — `run_dev_combined` derives the module path automatically:
+
+```python
+from application_sdk.main import run_dev_combined
+
+asyncio.run(run_dev_combined(MyMetadataExtractor))
+```
+
+Three modes are available:
+- `worker` — Temporal worker only (production worker pods)
+- `handler` — HTTP handler only (production handler pods)
+- `combined` — both in one process (local dev, SDR)
+
+---
+
+## Step 5b: Multiple Workflows Per App
+
+> Skip this step if your v2 connector had only one workflow.
+
+In v2 there was no first-class pattern for a connector that needed multiple workflows (e.g. metadata extraction + lineage + query mining). Teams worked around this with multiple `WorkflowInterface`/`ActivitiesInterface` pairs, separate entrypoint scripts, or other ad-hoc conventions.
+
+In v3, one `App` subclass can expose multiple independently-triggerable workflows by decorating methods with `@entrypoint`. All entry points share `@task` methods, the HTTP handler, and `AppContext` — no code duplication.
+
+### v2 — two separate workflow/activities pairs
+
+```python
+# app/workflows/metadata_extraction.py
+class MetadataExtractionWorkflow(WorkflowInterface):
+    async def run(self, input):
+        await execute_activity_method(self.activities.extract_tables, ...)
+        await execute_activity_method(self.activities.transform, ...)
+
+# app/activities/metadata_extraction.py
+class MetadataExtractionActivities(ActivitiesInterface):
+    async def extract_tables(self, input): ...
+    async def transform(self, input): ...
+
+# app/workflows/lineage.py
+class LineageWorkflow(WorkflowInterface):
+    async def run(self, input):
+        await execute_activity_method(self.activities.fetch_lineage, ...)
+
+# app/activities/lineage.py
+class LineageActivities(ActivitiesInterface):
+    async def fetch_lineage(self, input): ...
+```
+
+### v3 — one App, multiple @entrypoint methods
+
+```python
+# app/connector.py
+from application_sdk.app import App, entrypoint, task
+from application_sdk.contracts import Input, Output
+from typing import Any
+
+class ExtractionInput(Input, allow_unbounded_fields=True):
+    credential_guid: str = ""
+    connection: dict[str, Any] = {}
+
+class ExtractionOutput(Output):
+    transformed_data_prefix: str = ""
+
+class LineageInput(Input, allow_unbounded_fields=True):
+    credential_guid: str = ""
+    connection: dict[str, Any] = {}
+
+class LineageOutput(Output):
+    transformed_data_prefix: str = ""
+
+class SnowflakeApp(App):
+    # Shared task — callable from both entry points
+    @task(timeout_seconds=3600)
+    async def extract_tables(self, input: ExtractionInput) -> ExtractionOutput:
+        ...
+
+    @task(timeout_seconds=3600)
+    async def fetch_lineage(self, input: LineageInput) -> LineageOutput:
+        ...
+
+    @entrypoint
+    async def extract_metadata(self, input: ExtractionInput) -> ExtractionOutput:
+        return await self.extract_tables(input)
+
+    @entrypoint
+    async def extract_lineage(self, input: LineageInput) -> LineageOutput:
+        return await self.fetch_lineage(input)
+```
+
+### Workflow naming and HTTP dispatch
+
+| Entry point method | Temporal workflow name | HTTP trigger |
+|---|---|---|
+| `extract_metadata` | `{app-name}:extract-metadata` | `POST /workflows/v1/start?entrypoint=extract-metadata` |
+| `extract_lineage` | `{app-name}:extract-lineage` | `POST /workflows/v1/start?entrypoint=extract-lineage` |
+
+For multi-entry-point apps the `?entrypoint=` query parameter is **required** — omitting it returns 400.
+
+### Dockerfile
+
+One App = one `ATLAN_APP_MODULE` entry. No comma-separated list:
+
+```dockerfile
+ENV ATLAN_APP_MODULE=app.connector:SnowflakeApp
+```
+
+### Manifest layout for multi-entry-point apps
+
+For apps with multiple entry points, restructure `ATLAN_CONTRACT_GENERATED_DIR` into one subfolder per entry point (kebab-case):
+
+```
+app/generated/
+  extract-metadata/
+    manifest.json
+  extract-lineage/
+    manifest.json
+```
+
+Each manifest is served via `GET /workflows/v1/manifest?entrypoint=<name>` (returns 400 for invalid names, 404 if the folder is missing). Single-entry-point apps are unaffected — `GET /workflows/v1/manifest` (no query param) still works.
+
+See [`docs/concepts/entry-points.md`](concepts/entry-points.md) for the full `@entrypoint` and manifest reference.
+
+---
+
+## Step 6: Upgrade Worker Setup
+
+In v2, connecting to Temporal and registering workflow/activity classes was done explicitly.
+In v3, `create_worker()` auto-discovers all `App` subclasses and their `@task` methods — you
+don't register anything manually.
+
+### v2
+
+```python
+from application_sdk.worker import Worker
+from application_sdk.clients.temporal import TemporalWorkflowClient
+
+client = TemporalWorkflowClient(host=..., namespace=...)
+await client.load()
+
+worker = Worker(
+    workflow_client=client,
+    workflow_classes=[MyWorkflow],
+    workflow_activities=[MyActivities()],
+    passthrough_modules=["my_connector"],
+)
+await worker.run()
+```
+
+### v3
+
+Worker setup is fully automatic when you use the CLI or `run_dev_combined()`. If you need
+a worker handle directly (e.g., in integration tests):
+
+```python
+from application_sdk.execution import create_temporal_client, create_worker
+
+client = await create_temporal_client(host="localhost:7233")  # pass host/namespace explicitly
+
+# All registered App subclasses auto-discovered — no explicit list
+worker = create_worker(client)
+await worker.run()
+```
+
+Passthrough modules are declared on the `App` class itself as a `ClassVar` (a `set`, not a list), not as a class-kwarg:
+
+```python
+class MyConnector(App):
+    passthrough_modules = {"my_connector", "third_party_lib"}
+    ...
+```
+
+---
+
+## Step 7: Define Typed Contracts
+
+v3 uses `Input`/`Output` Pydantic models for all task boundaries. The SDK validates these at import time.
+
+```python
+from application_sdk.contracts import Input, Output, MaxItems
+from typing import Annotated
+
+class MyTaskInput(Input):
+    workflow_id: str
+    connection: str
+    items: Annotated[list[str], MaxItems(1000)]  # bounded list required
+
+class MyTaskOutput(Output):
+    items_processed: int
+    success: bool
+```
+
+Forbidden field types (raise `PayloadSafetyError` at class definition):
+- `Any`, `bytes`, `bytearray`
+- Unbounded `list[T]` or `dict[K, V]`
+
+Safe alternatives:
+- `Annotated[list[T], MaxItems(N)]` for bounded lists
+- `FileReference` for large data (stored in object store, not in-memory)
+- `allow_unbounded_fields=True` escape hatch (use sparingly)
+
+### ActivityStatistics / ActivityResult renamed
+
+The v2 activity return types are renamed in v3:
+
+| v2 (`application_sdk.activities.common.models`) | v3 (`application_sdk.common.models`) |
+|----|-----|
+| `ActivityStatistics` | `TaskStatistics` |
+| `ActivityResult` | `TaskResult` |
+
+In v3 templates these are returned inside typed `Output` models, so you generally won't
+import them directly unless you are building a custom `App` from scratch.
+
+### FileReference: passing large data between tasks
+
+Temporal has a payload size limit (~2 MB). Use `FileReference` to store large data in object
+storage and pass only a lightweight reference through the workflow.
+
+The framework handles upload and download **automatically and transparently** around every
+`@task` boundary:
+
+- **After** a task returns, any `FileReference` with `local_path` set (ephemeral) is
+  uploaded to the object store and the reference is made durable before it enters the
+  Temporal payload.
+- **Before** a task runs, any durable `FileReference` (with `storage_path` set) is
+  downloaded to a local temp path so `local_path` is populated when your method is called.
+
+You only need to declare `FileReference` fields in your contracts and use
+`FileReference.from_local()` when writing — no manual upload/download calls required:
+
+```python
+from application_sdk.contracts import Input, Output, FileReference
+
+class FetchOutput(Output):
+    results: FileReference  # auto-uploaded by the framework after fetch() returns
+
+class ProcessInput(Input):
+    results: FileReference  # auto-downloaded by the framework before process() runs
+
+# In the fetch task — write locally and return; the framework uploads automatically:
+async def fetch(self, input: FetchInput) -> FetchOutput:
+    local_path = "/tmp/results.parquet"
+    write_parquet(data, local_path)
+    return FetchOutput(results=FileReference.from_local(local_path))
+
+# In the next task — local_path is already populated by the framework:
+async def process(self, input: ProcessInput) -> ProcessOutput:
+    data = read_parquet(input.results.local_path)
+    ...
+```
+
+`FileReference` objects are tracked automatically and cleaned up by the framework's
+`cleanup_files()` / `cleanup_storage()` tasks.
+
+---
+
+## Step 8: Upgrade Infrastructure Access
+
+In v3, infrastructure services are created automatically at startup (by `main.py`) and
+injected into `@task` methods and handlers via `self.context`.
+You do not need to create `DaprClient` instances in your code.
+
+### Infrastructure available in `@task` methods
+
+| v2 | v3 (`self.context` in `@task` methods) |
+|----|----------------------------------------|
+| `services.statestore.StateStore.get_state(...)` | `await self.context.load_state(key)` |
+| `services.statestore.StateStore.save_state(...)` | `await self.context.save_state(key, value)` |
+| `services.secretstore.SecretStore.get_credentials(...)` | `await self.context.get_secret(name)` |
+| `services.objectstore.ObjectStore.get_content(key)` | `await download_file(key, local_path, self.context.storage)` |
+| `services.objectstore.ObjectStore.upload_file(src, key)` | `await upload_file(key, local_path, self.context.storage)` |
+| `services.eventstore.EventStore.publish_event(event)` | Automatic via interceptor |
+
+### Infrastructure available in handlers
+
+| v2 | v3 (`self.context` in handler methods) |
+|----|----------------------------------------|
+| `services.secretstore.SecretStore.get_credentials(...)` | `await self.context.get_secret(name)` |
+| `/workflows/v1/config/{id}` (503 error) | Works automatically (object store wired) |
+| `/workflows/v1/file` (503 error) | Works automatically (storage binding wired) |
+
+### Upgrading ObjectStore calls
+
+```python
+# v2 — all calls went through the Dapr binding
+from application_sdk.services.objectstore import ObjectStore
+
+await ObjectStore.upload_file(source="/local/file.parquet", key="output/file.parquet")
+data = await ObjectStore.get_content("config/settings.json")
+files = await ObjectStore.list_files(prefix="output/")
+await ObjectStore.delete_file("output/old.parquet")
+
+# v3 — inside an @task method, use the storage module with self.context.storage:
+from application_sdk.storage import upload_file, download_file
+await upload_file("output/file.parquet", "/local/file.parquet", self.context.storage)
+await download_file("config/settings.json", "/tmp/settings.json", self.context.storage)
+
+# v3 — outside an App (standalone scripts, utilities): use the storage module directly
+from application_sdk.storage import upload_file, download_file, list_keys, delete
+
+await upload_file("output/file.parquet", local_path="/local/file.parquet")
+await download_file("config/settings.json", local_path="/tmp/settings.json")
+keys = await list_keys(prefix="output/")
+await delete("output/old.parquet")
+```
+
+### Migrating AtlanStorage
+
+```python
+# v2
+from application_sdk.services.atlan_storage import AtlanStorage
+summary = await AtlanStorage(store, atlan_store).migrate_from_objectstore_to_atlan(prefix)
+
+# v3 — use the built-in App.upload() framework task, or compose storage calls directly
+# Inside a workflow run():
+await self.upload(UploadInput(local_path="output/"))
+```
+
+### Local development with credentials
+
+For production-equivalent local testing, run the Dapr sidecar (`uv run poe start-deps`) and let the app pick it up automatically via `DAPR_HTTP_PORT`. For quick local runs without a sidecar, pass credentials directly — `run_dev_combined` auto-provisions them via the local vault:
+
+```python
+from application_sdk.main import run_dev_combined
+
+asyncio.run(run_dev_combined(
+    MyApp,
+    credentials={"host": "localhost", "authType": "basic",
+                 "username": "dev", "password": "test-value"},
+))
+```
+
+---
+
+## Step 9: Upgrade to Typed Credentials
+
+v3 introduces a typed credential system that replaces bare `credential_guid: str` +
+`Dict[str, Any]` with a `CredentialRef` → typed `Credential` pipeline.
+
+### Before (credential_guid pattern)
+
+```python
+from application_sdk.contracts.base import Input
+
+class ExtractionInput(Input, allow_unbounded_fields=True):
+    credential_guid: str = ""
+
+# In @task method:
+from application_sdk.services.secretstore import SecretStore  # deprecated v2
+
+credentials = await SecretStore.get_credentials({"credential_guid": input.credential_guid})
+await client.load(credentials)  # dict[str, Any]
+```
+
+### After (CredentialRef pattern)
+
+```python
+from application_sdk.contracts import Input
+from application_sdk.credentials import CredentialRef, api_key_ref, ApiKeyCredential
+
+class ExtractionInput(Input, allow_unbounded_fields=True):
+    credential_ref: CredentialRef | None = None
+
+# In @task method:
+cred = await self.context.resolve_credential(input.credential_ref)
+assert isinstance(cred, ApiKeyCredential)
+headers = cred.to_headers()  # {"X-API-Key": "secret"}
+```
+
+### Backward compatibility
+
+Both `credential_guid` and `credential_ref` work on `ExtractionInput` and
+`QueryExtractionInput`. When only `credential_guid` is provided, the SDK
+auto-wraps it via `legacy_credential_ref()`:
+
+```python
+# These are both valid:
+ExtractionInput(credential_guid="abc-123")       # legacy — still works
+ExtractionInput(credential_ref=api_key_ref("prod-key"))  # new typed path
+```
+
+If you need to call a legacy client that expects a raw dict, use
+`resolve_credential_raw()`:
+
+```python
+raw = await self.context.resolve_credential_raw(ref)
+await client.load(raw)  # dict[str, Any] — same as before
+```
+
+### Available credential types
+
+| Type | Factory | Utility |
+|------|---------|---------|
+| `BasicCredential` | `basic_ref(name)` | `to_auth_header()` |
+| `ApiKeyCredential` | `api_key_ref(name)` | `to_headers()` |
+| `BearerTokenCredential` | `bearer_token_ref(name)` | `to_auth_header()`, `is_expired()` |
+| `OAuthClientCredential` | `oauth_client_ref(name)` | `to_headers()`, `needs_refresh()` |
+| `CertificateCredential` | `certificate_ref(name)` | — |
+| `GitSshCredential` | `git_ssh_ref(name)` | — |
+| `GitTokenCredential` | `git_token_ref(name)` | `to_auth_header()` |
+| `AtlanApiToken` | `atlan_api_token_ref(name)` | `to_auth_header()`, `validate()` |
+| `AtlanOAuthClient` | `atlan_oauth_client_ref(name)` | `to_headers()`, `validate()` |
+
+### Custom credential types
+
+```python
+from application_sdk.credentials import register_credential_type
+from pydantic import BaseModel
+
+class MyCredential(BaseModel, frozen=True):
+    api_token: str
+
+    @property
+    def credential_type(self) -> str:
+        return "my_service"
+
+    async def validate(self) -> None:
+        pass
+
+def _parse_my(data):
+    return MyCredential(api_token=data.get("api_token", ""))
+
+register_credential_type("my_service", MyCredential, _parse_my)
+```
+
+---
+
+## Step 10: Upgrade Atlan Client Access
+
+### v2
+
+```python
+from application_sdk.clients.atlan import get_client, get_async_client
+
+# Sync (removed in v3)
+client = get_client()
+
+# Async
+client = await get_async_client(token="...", url="...")
+```
+
+### v3
+
+Only async clients are exposed. Use the credential system to supply the token:
+
+```python
+from application_sdk.credentials import create_async_atlan_client, AtlanApiToken
+
+cred = AtlanApiToken(token="my-token", base_url="https://my-tenant.atlan.com")
+client = create_async_atlan_client(cred)
+```
+
+Inside an `App`, use the `AtlanClientMixin` to get a cached, per-run client:
+
+```python
+from application_sdk.credentials import AtlanClientMixin, atlan_api_token_ref
+
+class MyConnector(AtlanClientMixin, App):
+    @task
+    async def my_task(self, input: MyInput) -> MyOutput:
+        ref = atlan_api_token_ref("atlan-token")  # name of your secret store entry
+        client = await self.get_or_create_async_atlan_client(ref)
+        # client is an AsyncAtlanClient; cached for the lifetime of this run
+```
+
+### AtlanAuthClient
+
+```python
+# v2
+from application_sdk.clients.atlan_auth import AtlanAuthClient
+auth = AtlanAuthClient()
+headers = await auth.get_authenticated_headers()
+
+# v3
+from application_sdk.credentials import OAuthClientCredential, OAuthTokenService
+cred = OAuthClientCredential(client_id="...", client_secret="...", token_url="...")
+service = OAuthTokenService(cred)
+headers = await service.get_headers()
+```
+
+---
+
+## Step 11: Upgrade Heartbeating
+
+In v2, you applied `@auto_heartbeater` to activity methods to prevent Temporal from
+timing them out. In v3, heartbeating is built into `@task` — no decorator needed.
+
+### v2
+
+```python
+from application_sdk.activities.common.utils import auto_heartbeater
+
+class MyActivities(ActivitiesInterface):
+    @auto_heartbeater
+    @activity.defn
+    async def long_running_task(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        # heartbeats sent every 10 seconds automatically
+        ...
+```
+
+### v3
+
+```python
+from application_sdk.app import App, task
+
+class MyConnector(App):
+    # heartbeat_timeout_seconds: Temporal kills the task if no heartbeat is received
+    # auto_heartbeat_seconds: framework sends a heartbeat every N seconds automatically
+    @task(timeout_seconds=3600, heartbeat_timeout_seconds=60, auto_heartbeat_seconds=10)
+    async def long_running_task(self, input: MyInput) -> MyOutput:
+        # heartbeats are sent in a background loop — no decorator needed
+        ...
+```
+
+### Manual heartbeats with progress data
+
+Send a heartbeat with progress details so the task can resume from where it left off
+if Temporal restarts it:
+
+```python
+from application_sdk.contracts import HeartbeatDetails
+
+class MyProgress(HeartbeatDetails):
+    last_processed_id: str
+    records_done: int
+
+@task(heartbeat_timeout_seconds=60)
+async def process_batches(self, input: MyInput) -> MyOutput:
+    # Resume after a retry
+    prev = self.task_context.get_heartbeat_details(MyProgress)
+    start_id = prev.last_processed_id if prev else None
+
+    for batch in get_batches(start_from=start_id):
+        process(batch)
+        self.task_context.heartbeat(MyProgress(
+            last_processed_id=batch.id,
+            records_done=batch.count,
+        ))
+```
+
+### Blocking sync operations
+
+If you call blocking (non-async) code inside a task (e.g., a sync SDK or driver),
+use `run_in_thread` to avoid blocking the event loop and stalling heartbeats:
+
+```python
+@task(heartbeat_timeout_seconds=60)
+async def fetch(self, input: MyInput) -> MyOutput:
+    result = await self.task_context.run_in_thread(my_sync_function, arg1, arg2)
+    return MyOutput(data=result)
+```
+
+---
+
+## Step 11b: The stall watchdog
+
+What if you do nothing? The SDK now runs a **stall watchdog** inside every activity: it watches for observable
+forward progress, and reports when an attempt goes quiet for longer than
+`max_no_progress_seconds` (900s). At the same time `timeout_seconds`
+(`start_to_close`) becomes a **24h backstop** you never tune, instead of a duration you
+guess.
+
+**There is no migration task here.** This step exists to tell you that, precisely.
+
+### On upgrade, no failure *semantics* change (the default timeout and telemetry do)
+
+- You land in **`warn` mode**, which cannot fail an activity. It observes and reports.
+- `heartbeat_timeout_seconds` keeps its meaning and its 60s default. Crash, OOM and
+  node-loss detection is unchanged.
+- No existing knob changes meaning, so there is no coupled default to bump.
+- The one thing that *does* change immediately is in your favour: with the backstop at
+  24h, a legitimately long run stops dying at a guessed ceiling.
+
+What you gain is a report about your own code — the sites that go quiet, and the long
+opaque calls the SDK is currently vouching for unbounded. Reading it is optional and
+can wait; the app stays correct indefinitely without it.
+
+### The added cost is telemetry
+
+Two histograms and the occasional INFO log line. Warn-mode findings are deliberately
+**never** WARNING-level — a stall observation under a fleet-wide default is an expected
+observation, not an alert.
+
+If you need most of that gone, `ATLAN_PROGRESS_WATCHDOG=off` — or
+`progress_watchdog="off"` on a single `@task` — is the kill-switch: no gap is reported
+and nothing is ever failed. It is not the normal state, and it also switches off the
+report you would otherwise use later. Note it is not *completely* inert — hold
+observations still record, since those are a work-list entry rather than a watchdog
+action — and it does not shorten a wedged attempt, which is bounded by
+`timeout_seconds` either way.
+
+### One knob did change value: `timeout_seconds`
+
+`ATLAN_START_TO_CLOSE_TIMEOUT_SECONDS` now defaults to **86400** (24 h) instead of 600.
+Nothing changes for a task that passes `timeout_seconds=` explicitly — which, if your app
+weight-classed its tasks, is most of them. Those explicit numbers are now the thing worth
+deleting: they are the guesses ADR-0018 exists to remove, and with the backstop in place
+a legitimately long attempt no longer needs one to survive. Delete them at your own pace;
+nothing forces it.
+
+The one consequence to be aware of is on the other side of the trade: a *wedged* attempt
+is no longer killed by a small ceiling, so while your app is in `warn` its containment is
+the `AtlanAppTaskStalled` alert plus a human rather than an automatic kill. Detection
+improves — a wedge is now visible one budget in, where before it was only ever killed by
+luck. See [ADR-0018 → Migration](adr/0018-progress-aware-heartbeat.md#migration--backward-compatibility--what-if-i-do-nothing)
+for why that trade is the one being made.
+
+### Declaring holds is an eventual optimisation, not an upgrade task
+
+Wrapping opaque calls in `holding_progress()` is work you take on when you want the
+stronger guarantee — a wedge caught in minutes rather than at the backstop — at a time
+of your choosing, guided by your own warn report. It is not a precondition for taking
+the version.
+
+### Which code shapes eventually need action
+
+Relevant only if and when you flip an app to `enforce`:
+
+| Your existing code | In `warn` (today) | In `enforce` | Action |
+|---|---|---|---|
+| Streaming through SDK writers / `ObjectStore` transfers / template page loops | silent | covered — hooks mark progress | none |
+| Already calls `self.heartbeat(...)` | silent | covered — a beat marks progress | none |
+| Opaque blocking call via `run_in_thread` | reported as a long unbounded hold | covered — unbounded auto-hold; the backstop is the only bound | optional: declare an allowance to get a real bound |
+| **A custom async loop doing its own I/O** | reported as a no-progress gap | **false-killed** if any gap exceeds the budget | add a beat or a hold |
+| **An opaque single `await` against your source** (your own async client) | reported as a no-progress gap | **false-killed at the tail** | wrap in `holding_progress()` — expected in nearly every connector |
+
+The last two rows are why `enforce` is a per-app decision verified against a
+large-tenant profile, not a smoke test.
+
+See [Progress and Stalls](concepts/progress-and-stalls.md) for the three knobs, how to
+read your warn report, and how to size an allowance.
+
+---
+
+## Step 12: App Lifecycle Hooks
+
+v3 adds structured lifecycle hooks that replace ad-hoc cleanup logic that was
+previously scattered across activities or added as a final workflow step.
+
+### on_complete
+
+`on_complete` is called after `run()` finishes (whether successful or not):
+
+```python
+class MyConnector(App):
+    async def run(self, input: ExtractionInput) -> ExtractionOutput:
+        ...
+
+    async def on_complete(self) -> None:
+        await self.notify_downstream()
+        await super().on_complete()  # preserves built-in file/storage cleanup
+```
+
+### Built-in cleanup tasks
+
+Two cleanup tasks are built into every `App`. Call them from `run()` or `on_complete()`:
+
+```python
+async def on_complete(self) -> None:
+    await super().on_complete()  # runs built-in file/storage cleanup
+```
+
+`cleanup_files()` and `cleanup_storage()` are also available as individual workflow steps
+if you need to trigger cleanup mid-run (e.g., after a particularly large intermediate step).
+
+---
+
+## Step 13: Upgrade Test Utilities
+
+### Import paths
+
+```python
+# v2 — all of these are deprecated
+from application_sdk.test_utils import ...
+from application_sdk.test_utils.credentials import MockCredentialStore
+from application_sdk.test_utils.scale_data_generator import ...
+
+# v3
+from application_sdk.testing import (
+    MockStateStore,
+    MockSecretStore,
+    MockBinding,
+    MockPubSub,
+    MockCredentialStore,
+    MockHeartbeatController,
+)
+from application_sdk.testing.scale_data_generator import ...
+```
+
+### Using mock infrastructure in tests
+
+In v3 you can test `@task` methods without any Dapr sidecar running:
+
+```python
+import pytest
+from application_sdk.testing import MockSecretStore, MockStateStore
+from application_sdk.infrastructure import set_infrastructure, InfrastructureContext
+
+@pytest.fixture
+def infra():
+    ctx = InfrastructureContext(
+        secret_store=MockSecretStore({"api-key": "test-secret"}),
+        state_store=MockStateStore(),
+    )
+    set_infrastructure(ctx)
+    return ctx
+
+async def test_my_task(infra):
+    connector = MyConnector()
+    output = await connector.my_task(MyInput(connection_id="test"))
+    assert output.record_count > 0
+```
+
+### Pytest fixtures provided by the framework
+
+```python
+# conftest.py — import to make the fixture available project-wide
+from application_sdk.testing import clean_app_registry
+
+# test_my_app.py — list it as a parameter on each test that needs isolation
+async def test_something(clean_app_registry):
+    ...
+```
+
+The `clean_app_registry` fixture resets `AppRegistry` and `TaskRegistry` between tests,
+preventing subclass registrations in one test from leaking into the next. It is not
+autouse — you must list it in the test's parameter list to activate it.
+
+### MockCredentialStore
+
+```python
+from application_sdk.testing import MockCredentialStore
+from application_sdk.credentials import CredentialResolver
+
+mock = MockCredentialStore()
+ref = mock.add_api_key("test-key", api_key="test-secret")
+
+resolver = CredentialResolver(mock.secret_store)
+cred = await resolver.resolve(ref)
+assert cred.api_key == "test-secret"
+```
+
+### MockHeartbeatController
+
+For testing tasks that use `self.task_context.heartbeat()` without running inside Temporal:
+
+```python
+from application_sdk.testing import MockHeartbeatController
+
+controller = MockHeartbeatController()
+# inject into task context or pass to the function under test
+# controller.get_heartbeat_calls() returns the list of heartbeat calls
+```
+
+### Running locally with credentials
+
+For quick local runs without a Dapr sidecar, pass credentials directly — `run_dev_combined` provisions them via the local vault, exactly as production does. For test isolation with typed mock infrastructure, use `InfrastructureContext` directly in pytest fixtures (see testing section above).
+
+```python
+from application_sdk.main import run_dev_combined
+
+asyncio.run(run_dev_combined(
+    MyConnector,
+    credentials={"host": "localhost", "authType": "basic",
+                 "username": "dev", "password": "test-value"},
+))
+```
+
+---
+
+## Removed in v3.0.0
+
+All of the following were removed in v3.0.0. They no longer exist — importing them will raise `ImportError`. Use the v3 replacement listed in each row.
+
+### Application / Entry Point
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.application.BaseApplication` | `application_sdk.app.App` + `application_sdk.main.run_dev_combined` |
+| `application_sdk.application.metadata_extraction.sql.BaseSQLMetadataExtractionApplication` | `application_sdk.templates.SqlMetadataExtractor` |
+| Multiple `WorkflowInterface` pairs (comma-separated `ATLAN_APP_MODULE`) | Single `App` with multiple `@entrypoint` methods (see Step 5b) |
+
+### Worker
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.worker.Worker` | `application_sdk.execution.create_worker` |
+
+### Workflows
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.workflows.WorkflowInterface` | `application_sdk.app.App` with `@task` |
+| `application_sdk.workflows.metadata_extraction.MetadataExtractionWorkflow` | `application_sdk.templates.SqlMetadataExtractor` |
+| `application_sdk.workflows.metadata_extraction.sql.BaseSQLMetadataExtractionWorkflow` | `application_sdk.templates.SqlMetadataExtractor` |
+| `application_sdk.workflows.metadata_extraction.incremental_sql.IncrementalSQLMetadataExtractionWorkflow` | `application_sdk.templates.IncrementalSqlMetadataExtractor` |
+| `application_sdk.workflows.query_extraction.QueryExtractionWorkflow` | `application_sdk.templates.SqlQueryExtractor` |
+| `application_sdk.workflows.query_extraction.sql.SQLQueryExtractionWorkflow` | `application_sdk.templates.SqlQueryExtractor` |
+
+### Activities
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.activities.ActivitiesInterface` | `application_sdk.app.App` with `@task` |
+| `application_sdk.activities.common.models.ActivityStatistics` | `application_sdk.common.models.TaskStatistics` |
+| `application_sdk.activities.common.models.ActivityResult` | `application_sdk.common.models.TaskResult` |
+| `application_sdk.activities.common.utils` | `application_sdk.execution` (`build_output_path`, `get_object_store_prefix` are re-exported; direct activity internals should be accessed via `Input.workflow_id` instead) |
+| `application_sdk.activities.metadata_extraction.base` | `application_sdk.app.App` (non-SQL source); `application_sdk.templates.SqlApp` (SQL source) |
+| `application_sdk.activities.metadata_extraction.sql` | `application_sdk.templates.SqlMetadataExtractor` |
+| `application_sdk.activities.metadata_extraction.incremental` | `application_sdk.templates.IncrementalSqlMetadataExtractor` |
+| `application_sdk.activities.query_extraction.sql` | `application_sdk.templates.SqlQueryExtractor` |
+
+> **Note:** `application_sdk.common.sql_utils` (the v3-era replacement for `application_sdk.activities.common.sql_utils`) has also been removed. Apps that still depend on it should migrate to `BaseSQLClient` directly.
+
+### Handlers
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.handlers.HandlerInterface` | `application_sdk.handler.base.Handler` |
+| `application_sdk.handlers.base.BaseHandler` | `application_sdk.handler.base.DefaultHandler` |
+| `application_sdk.handlers.sql.BaseSQLHandler` | `application_sdk.templates` (SQL logic absorbed) |
+
+### Services
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.services.objectstore.ObjectStore` | `application_sdk.storage` module |
+| `application_sdk.services.statestore.StateStore` | `application_sdk.infrastructure.state.StateStore` |
+| `application_sdk.services.secretstore.SecretStore` | `application_sdk.infrastructure.secrets.SecretStore` |
+| `application_sdk.services.eventstore.EventStore` | automatic via interceptor; or `get_infrastructure().event_binding` |
+| `application_sdk.services.atlan_storage.AtlanStorage` | `application_sdk.storage` or `App.upload()` / `App.download()` |
+
+### Clients
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.clients.atlan.get_client` | removed — sync client no longer supported |
+| `application_sdk.clients.atlan.get_async_client` | `application_sdk.credentials.create_async_atlan_client` |
+| `application_sdk.clients.atlan_auth.AtlanAuthClient` | `application_sdk.credentials.OAuthTokenService` |
+
+### Test Utilities
+
+| Deprecated | Replacement |
+|---|---|
+| `application_sdk.test_utils` | `application_sdk.testing` |
+| `application_sdk.test_utils.credentials.MockCredentialStore` | `application_sdk.testing.MockCredentialStore` |
+| `application_sdk.test_utils.scale_data_generator` | `application_sdk.testing.scale_data_generator` |
