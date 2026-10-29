@@ -106,10 +106,24 @@ def assert_no_duplicate_qualified_names(entities: list[dict[str, Any]]) -> None:
         )
 
 
+class _AlwaysTableResolver:
+    """Preserves the pre-0.4.5 behaviour (hard-coded `Table` on lineage inputs)
+    for closure tests that don't care about dynamic type resolution — only
+    that references land at all. Tests that exercise typeName semantics live
+    in `test_transformer.py` and `test_atlan_catalog.py`."""
+
+    enabled = True
+    stats: dict[str, int] = {}
+
+    def resolve_type(self, qualified_name: str) -> str:
+        return "Table"
+
+
 def _transform(snapshot: dict[str, Any], source_map: dict[str, str] | None = None):
     return OmniMetadataTransformer(
         connection_epoch_ms=EPOCH,
         atlan_source_connection_map=source_map or {},
+        source_type_resolver=_AlwaysTableResolver(),
     ).transform(snapshot=snapshot)
 
 

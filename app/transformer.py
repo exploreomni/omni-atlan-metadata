@@ -63,6 +63,7 @@ class OmniMetadataTransformer:
         self,
         connection_epoch_ms: str,
         atlan_source_connection_map: dict[str, str] | None = None,
+        source_type_resolver: Any = None,
     ):
         if not connection_epoch_ms or not str(connection_epoch_ms).isdigit():
             raise ValueError(
@@ -84,6 +85,12 @@ class OmniMetadataTransformer:
             for k, v in (atlan_source_connection_map or {}).items()
             if k and v
         }
+        # Resolves warehouse QN -> Atlan typeName (Table / View /
+        # MaterialisedView). The hard-coded "Table" that `_processes_source_to_topic`
+        # used to emit caused ATLAS-404s on tenants where some sources were
+        # views. If None (local dev, no Atlan creds), source-lineage falls
+        # back to emitting nothing — we never guess `Table` again.
+        self.source_type_resolver = source_type_resolver
 
     # ------------------------------------------------------------------ #
     # Public entrypoint
@@ -148,8 +155,16 @@ class OmniMetadataTransformer:
         chosen_topics = self._dedup_topics(topics, emitted_model_ids)
         emitted_topic_qns = set(chosen_topics.keys())
 
+        # Order models parent-first so Atlan's publisher — which commits in
+        # batches of 20 and resolves `omniV01BaseModel` as it goes — always has
+        # the referent already landed by the time the referrer arrives.
+        # Topological order on the `baseModelId` chain; models whose base is
+        # NOT in emitted_model_ids (SHARED-on-SCHEMA shape, or any dangling
+        # reference we'd otherwise skip in `_models`) are treated as roots.
+        ordered_models = self._topologically_sort_models(models, emitted_model_ids)
+
         entities: list[dict[str, Any]] = []
-        entities.extend(self._models(models, emitted_model_ids))
+        entities.extend(self._models(ordered_models, emitted_model_ids))
         entities.extend(self._topics_from_chosen(chosen_topics))
         entities.extend(self._folders(folders))
         entities.extend(self._documents(documents, emitted_folder_ids))
@@ -165,6 +180,78 @@ class OmniMetadataTransformer:
             )
         )
         return entities
+
+    @staticmethod
+    def _topologically_sort_models(
+        models: list[dict[str, Any]],
+        emitted_model_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Order models parent-first, following `baseModelId` within the
+        emitted set. Non-emitted parents (SHARED-on-SCHEMA shape, or a
+        base model the filter dropped) are treated as roots.
+
+        Atlan's publisher commits in batches of ~20 and resolves
+        `omniV01BaseModel` as it goes — if a child arrives before its
+        parent, the parent QN is unresolvable and the record is
+        rejected (ATLAS-404-00-00A). Observed on CCI's 2026-10-28 run:
+        4 models missed, cascading to 38 total rejections (topics /
+        documents that pointed at them). API order from `/v1/models`
+        is not safe; we have to make it safe here.
+
+        Uses Kahn's algorithm so arbitrary chain depth works
+        (shared → shared_extension → workbook, etc.). On a cycle —
+        shouldn't happen in Omni, but a defective API could — falls
+        back to the input order with a WARN rather than returning
+        a partial list.
+        """
+        # Dependency edge: model -> parent (if parent is emitted). Only
+        # emitted parents count: if the base will NOT be emitted, our
+        # `_models` builder won't write the `omniV01BaseModel` ref either,
+        # so there's no ordering constraint from it.
+        remaining_deps: dict[str, int] = {}
+        children_of: dict[str, list[str]] = {}
+        by_id: dict[str, dict[str, Any]] = {}
+
+        for m in models:
+            model_id = m.get("id")
+            if not model_id:
+                continue
+            model_id = str(model_id)
+            by_id[model_id] = m
+            base = m.get("baseModelId")
+            if base and base in emitted_model_ids and base != model_id:
+                remaining_deps[model_id] = remaining_deps.get(model_id, 0) + 1
+                children_of.setdefault(str(base), []).append(model_id)
+            else:
+                remaining_deps.setdefault(model_id, 0)
+
+        # Roots first — stable within tier so the output is deterministic
+        # across runs (same tenant should produce byte-identical NDJSON).
+        ready = [mid for mid in by_id if remaining_deps.get(mid, 0) == 0]
+        ordered_ids: list[str] = []
+        while ready:
+            # Preserve input order within a tier.
+            tier = sorted(ready, key=lambda mid: list(by_id).index(mid))
+            ready = []
+            for mid in tier:
+                ordered_ids.append(mid)
+                for child in children_of.get(mid, []):
+                    remaining_deps[child] -= 1
+                    if remaining_deps[child] == 0:
+                        ready.append(child)
+
+        if len(ordered_ids) != len(by_id):
+            missing = [m for m in models if m.get("id") and str(m["id"]) not in ordered_ids]
+            logger.warning(
+                "model topological sort found a cycle or orphan; "
+                f"falling back to input order for {len(missing)} model(s). "
+                "This should never happen on real Omni data — investigate."
+            )
+            # Append the leftovers in input order so we still emit everything.
+            for m in missing:
+                ordered_ids.append(str(m["id"]))
+
+        return [by_id[mid] for mid in ordered_ids]
 
     @staticmethod
     def _should_emit_model(
@@ -572,7 +659,21 @@ class OmniMetadataTransformer:
                 if table_qn in seen_qns:
                     continue
                 seen_qns.add(table_qn)
-                input_refs.append(self._rel_ref("Table", table_qn))
+                # Resolve the source's typeName via Atlan's catalog. The old
+                # hard-coded "Table" caused ATLAS-404s on tenants where the
+                # physical object was actually a View or MaterialisedView —
+                # Omni's `.view` YAML doesn't carry the object kind, Atlan's
+                # catalog does. If the resolver returns None (not configured,
+                # not found, lookup errored) we SKIP this source rather than
+                # guess, so a dangling ref never reaches publish.
+                type_name = (
+                    self.source_type_resolver.resolve_type(table_qn)
+                    if self.source_type_resolver is not None
+                    else None
+                )
+                if not type_name:
+                    continue
+                input_refs.append(self._rel_ref(type_name, table_qn))
 
             if not input_refs:
                 continue
