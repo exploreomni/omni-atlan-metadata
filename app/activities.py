@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+from app.atlan_catalog import AtlanCatalogResolver
 from app.client import ClientClass, NonRetryableOmniApiError, OmniApiError
 from app.handler import HandlerClass
 from app.transformer import OmniMetadataTransformer
@@ -233,14 +234,26 @@ class ActivitiesClass(ActivitiesInterface):
         finally:
             run_client.close()
 
+        # Resolve warehouse QNs -> Atlan typeName at transform time so the
+        # emitted `Process.inputs` reference the correct type (Table / View /
+        # MaterialisedView / ...). ATLAN_BASE_URL / ATLAN_API_KEY are the
+        # same env the typedef registration already uses. When they're not
+        # set (local playground), the resolver reports .enabled == False and
+        # source-table lineage emits nothing — same as if atlan_source_connection_map
+        # weren't set. We never fall back to guessing "Table".
+        source_type_resolver = AtlanCatalogResolver()
         transformer = OmniMetadataTransformer(
             connection_epoch_ms=args["metadata"]["connection_epoch_ms"],
             atlan_source_connection_map=args["metadata"].get("atlan_source_connection_map", {}),
+            source_type_resolver=source_type_resolver,
         )
-        # The transform is CPU-bound and synchronous; on a large snapshot it
-        # blocks the event loop long enough to stall `auto_heartbeater`. Run it
-        # off-loop so heartbeats keep flowing.
-        entities = await asyncio.to_thread(transformer.transform, snapshot=snapshot)
+        try:
+            # The transform is CPU-bound and synchronous; on a large snapshot it
+            # blocks the event loop long enough to stall `auto_heartbeater`. Run it
+            # off-loop so heartbeats keep flowing.
+            entities = await asyncio.to_thread(transformer.transform, snapshot=snapshot)
+        finally:
+            source_type_resolver.close()
 
         # Write entities via the SDK writer, which uploads to the Atlan object store
         # (when ENABLE_ATLAN_UPLOAD=true in production) or writes locally (in dev).
@@ -292,4 +305,9 @@ class ActivitiesClass(ActivitiesInterface):
             "forbidden_model_ids_total": len(
                 getattr(run_client, "_forbidden_model_ids", []) or []
             ),
+            # Lineage source-type resolution stats so a reviewer can see at a
+            # glance how many sources Atlan knew about vs. how many we skipped
+            # (crawler not run on that connection, source dropped, etc).
+            "source_type_resolver_stats": source_type_resolver.stats,
+            "source_type_resolver_enabled": source_type_resolver.enabled,
         }

@@ -1387,7 +1387,7 @@ wheels = [
 
 [[package]]
 name = "omni-connector-app"
-version = "0.4.3"
+version = "0.4.5"
 source = { editable = "." }
 dependencies = [
     { name = "atlan-application-sdk", extra = ["tests", "workflows"] },

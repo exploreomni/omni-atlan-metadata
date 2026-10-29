@@ -1,5 +1,7 @@
 """Tests for app/transformer.py — OmniV01* typedef alignment."""
 
+from typing import Any
+
 import pytest
 
 from app.transformer import OmniMetadataTransformer
@@ -93,12 +95,50 @@ SNAPSHOT = {
 }
 
 
+class _StubSourceTypeResolver:
+    """Trivial resolver that answers whatever `response` says for each QN.
+
+    `response` can be a mapping (`{qn: typeName}`) or a bare string
+    ("Table" to make every QN resolve to Table — the historical default
+    from before source-type resolution was dynamic). `enabled` controls
+    the activity-dict stat; defaults to True so most tests look like
+    production.
+    """
+
+    def __init__(
+        self,
+        response: dict[str, str] | str | None = "Table",
+        enabled: bool = True,
+    ) -> None:
+        self._response = response
+        self.enabled = enabled
+        self.calls: list[str] = []
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return {"lookups": len(self.calls), "hits": 0, "misses": 0, "errors": 0}
+
+    def resolve_type(self, qualified_name: str) -> str | None:
+        self.calls.append(qualified_name)
+        if isinstance(self._response, dict):
+            return self._response.get(qualified_name)
+        return self._response
+
+
 def transform(
     atlan_source_connection_map: dict[str, str] | None = None,
+    source_type_resolver: Any = None,
 ) -> list[dict]:
+    # Default to a resolver that still emits Table for every QN so the
+    # existing suite — written before source-type resolution — keeps the
+    # same semantics it had. Tests that care about the new behaviour pass
+    # their own resolver explicitly.
+    if source_type_resolver is None:
+        source_type_resolver = _StubSourceTypeResolver(response="Table")
     t = OmniMetadataTransformer(
         connection_epoch_ms=EPOCH,
         atlan_source_connection_map=atlan_source_connection_map,
+        source_type_resolver=source_type_resolver,
     )
     return t.transform(SNAPSHOT)
 
@@ -692,6 +732,7 @@ def test_source_process_deduped_to_shared_topic():
     result = OmniMetadataTransformer(
         connection_epoch_ms=EPOCH,
         atlan_source_connection_map={"c1": "default/snowflake/1700"},
+        source_type_resolver=_StubSourceTypeResolver(response="Table"),
     ).transform(_wb_snapshot(overridden=False))
     source_procs = [
         e for e in result if e["typeName"] == "Process"
@@ -723,3 +764,205 @@ def test_tile_topic_uncatalogued_is_skipped_not_backfilled():
     result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
     procs = [e for e in result if e["typeName"] == "Process"]
     assert procs == []
+
+
+# ---------------------------------------------------------------------------
+# 0.4.5 — model topological sort (ATLAS-404 at publish on CCI's 2026-10-28 run)
+# ---------------------------------------------------------------------------
+
+def _topo_snapshot(models: list[dict]) -> dict:
+    """Minimal snapshot carrying just the models we want to order."""
+    return {
+        "connections": [],
+        "models": models,
+        "topics": [],
+        "folders": [],
+        "documents": [],
+        "document_model_ids": [m["id"] for m in models if m.get("modelKind") == "WORKBOOK"],
+    }
+
+
+def _emitted_order(entities: list[dict]) -> list[str]:
+    return [
+        e["attributes"]["omniV01Id"]
+        for e in entities
+        if e["typeName"] == "OmniV01Model"
+    ]
+
+
+def test_models_emitted_parent_before_child():
+    """Workbook that references a shared base must land AFTER the shared one,
+    so Atlan's publisher resolves `omniV01BaseModel` without ATLAS-404."""
+    # API order from /v1/models puts the WORKBOOK before its SHARED parent —
+    # exactly the pathological case from CCI's run.
+    snap = _topo_snapshot([
+        {"id": "wb1", "name": "WB", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+        {"id": "shared1", "modelKind": "SHARED"},
+    ])
+    out = transform()  # uses the default stub resolver
+    # transform() uses the module-level SNAPSHOT fixture, so I need to run
+    # the transform here directly against our minimal snapshot:
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        source_type_resolver=_StubSourceTypeResolver(response="Table"),
+    ).transform(snap)
+    order = _emitted_order(out)
+    assert order.index("shared1") < order.index("wb1"), order
+
+
+def test_models_emitted_chain_depth_3_order():
+    """Multi-hop: shared -> extension -> workbook. All in the emitted set.
+    Order must be shared, extension, workbook regardless of API order."""
+    snap = _topo_snapshot([
+        # Fed in reverse-order to force the sort to do real work.
+        {"id": "wb", "name": "WB", "modelKind": "WORKBOOK", "baseModelId": "ext"},
+        # Note: SHARED_EXTENSION isn't a representable modelKind so our
+        # emitter would reject it. Using SHARED here as a stand-in since the
+        # topo sort is about the chain, not the kind — if a model is in
+        # emitted_model_ids it has to come after its base. Use two SHARED
+        # tiers.
+        {"id": "ext", "modelKind": "SHARED", "baseModelId": "shared"},
+        {"id": "shared", "modelKind": "SHARED"},
+    ])
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        source_type_resolver=_StubSourceTypeResolver(response="Table"),
+    ).transform(snap)
+    order = _emitted_order(out)
+    assert order.index("shared") < order.index("ext") < order.index("wb"), order
+
+
+def test_models_with_schema_base_treated_as_root():
+    """A SHARED whose baseModelId is a SCHEMA (filtered out) has no edge in
+    the emitted graph — it's a root, and must emit without being blocked on
+    anything."""
+    snap = _topo_snapshot([
+        {"id": "shared1", "modelKind": "SHARED", "baseModelId": "schema1"},
+        {"id": "schema1", "modelKind": "SCHEMA"},  # filtered by _should_emit_model
+    ])
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        source_type_resolver=_StubSourceTypeResolver(response="Table"),
+    ).transform(snap)
+    order = _emitted_order(out)
+    assert order == ["shared1"]  # schema1 is filtered, shared1 emits
+
+
+def test_models_topo_sort_cycle_falls_back_without_dropping(caplog):
+    """A cycle in Omni's data (shouldn't happen but could) must not lose
+    models — fall back to input order with a WARN rather than return a
+    partial list."""
+    snap = _topo_snapshot([
+        {"id": "a", "modelKind": "SHARED", "baseModelId": "b"},
+        {"id": "b", "modelKind": "SHARED", "baseModelId": "a"},
+    ])
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        source_type_resolver=_StubSourceTypeResolver(response="Table"),
+    ).transform(snap)
+    order = _emitted_order(out)
+    assert sorted(order) == ["a", "b"], "cycle must not drop models"
+
+
+# ---------------------------------------------------------------------------
+# 0.4.5 — source typeName via Atlan catalog resolver
+# ---------------------------------------------------------------------------
+
+def _source_snapshot() -> dict:
+    """Snapshot with one topic + one source view ready for lineage."""
+    return {
+        "connections": [{"id": "c1", "database": "analytics"}],
+        "models": [{"id": "m1", "modelKind": "SHARED", "connectionId": "c1"}],
+        "topics": [{
+            "modelId": "m1",
+            "owningModelId": "m1",
+            "name": "orders",
+            "label": "Orders",
+            "viewSources": [{"viewName": "v1", "tableName": "orders",
+                             "schema": "public", "catalog": "analytics"}],
+        }],
+        "folders": [],
+        "documents": [],
+        "document_model_ids": [],
+    }
+
+
+def test_source_input_type_comes_from_resolver_not_hardcoded_table():
+    """CCI's bug: 32 of 57 lineage inputs on 2026-10-28 were Redshift Views
+    but we emitted `typeName: Table`, and Atlan's publisher 404'd on each.
+    Resolver must drive the type."""
+    resolver = _StubSourceTypeResolver(response={
+        "default/redshift/x/analytics/public/orders": "View",
+    })
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/redshift/x"},
+        source_type_resolver=resolver,
+    ).transform(_source_snapshot())
+    procs = [e for e in out if e["typeName"] == "Process"
+             and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")]
+    assert len(procs) == 1
+    inputs = procs[0]["relationshipAttributes"]["inputs"]
+    assert len(inputs) == 1
+    assert inputs[0]["typeName"] == "View", (
+        f"expected typeName from resolver, got {inputs[0]['typeName']}"
+    )
+
+
+def test_source_dropped_when_resolver_returns_none():
+    """Resolver answers None (QN not in Atlan's catalog). We SKIP that
+    source rather than guess `Table` — the hard-code was the bug.
+    The Process still emits because at least one source resolved; if ALL
+    sources are missing, the Process is skipped entirely (no input_refs)."""
+    resolver = _StubSourceTypeResolver(response=None)
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/redshift/x"},
+        source_type_resolver=resolver,
+    ).transform(_source_snapshot())
+    source_procs = [e for e in out if e["typeName"] == "Process"
+                    and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")]
+    assert source_procs == [], "all-missing-sources must emit no Process"
+
+
+def test_source_skipped_when_resolver_not_provided():
+    """Local dev: no Atlan creds, no resolver. Source lineage emits nothing
+    rather than hard-coding `Table`. The existing suite relies on this
+    because many tests don't pass a resolver."""
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/snowflake/1700"},
+        # no source_type_resolver=
+    ).transform(_source_snapshot())
+    source_procs = [e for e in out if e["typeName"] == "Process"
+                    and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")]
+    assert source_procs == []
+
+
+def test_source_resolver_mixed_types_in_same_schema():
+    """CCI's real shape: same schema, some objects are Tables, others Views.
+    Emit each with its own correct type."""
+    resolver = _StubSourceTypeResolver(response={
+        "default/redshift/x/analytics/public/orders": "Table",
+        "default/redshift/x/analytics/public/customers_view": "View",
+    })
+    snap = _source_snapshot()
+    snap["topics"][0]["viewSources"].append({
+        "viewName": "v2",
+        "tableName": "customers_view",
+        "schema": "public",
+        "catalog": "analytics",
+    })
+    out = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/redshift/x"},
+        source_type_resolver=resolver,
+    ).transform(snap)
+    proc = next(e for e in out if e["typeName"] == "Process"
+                and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/"))
+    by_qn = {i["uniqueAttributes"]["qualifiedName"]: i["typeName"]
+             for i in proc["relationshipAttributes"]["inputs"]}
+    assert by_qn == {
+        "default/redshift/x/analytics/public/orders": "Table",
+        "default/redshift/x/analytics/public/customers_view": "View",
+    }

@@ -4,6 +4,51 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-10-29
+
+Two publish-blocking fixes from Atlan's 2026-10-29 review of CCI's first
+successful 0.4.4 extraction. Extraction landed clean (6,252 models in
+~4h, 2,800 forbidden skipped without aborting), but the publish step was
+rejected: 95 assets failed with `ATLAS-404-00-00A` — 57 from a
+hard-coded `Table` typeName on lineage inputs that were actually views,
+and 38 from a workbook model arriving at the publisher before its
+shared base model.
+
+### Fixed
+
+- **Lineage input typeName now resolved from Atlan's catalog.**
+  `_processes_source_to_topic` used to emit `typeName: "Table"` for
+  every warehouse source. The physical object type is not in Omni's
+  `.view` YAML — it's a Looker-style abstraction with `table_name` /
+  `schema` / `catalog` and nothing about kind. The resolver
+  (`app/atlan_catalog.py`) asks Atlan's indexsearch endpoint which type
+  each QN is before we emit the reference, and caches per-run. If a QN
+  isn't in Atlan's catalog (warehouse crawler never ran, source
+  dropped, lookup errored), the source is SKIPPED rather than guessed —
+  guessing is what caused the ATLAS-404s. Uses the same `ATLAN_BASE_URL`
+  / `ATLAN_API_KEY` env the typedef registration already consumes.
+
+- **Models are now written in topological order.** `_models()` emitted
+  in API order from `/v1/models`. Atlan publishes in batches of ~20
+  and resolves `omniV01BaseModel` as it goes, so a workbook that
+  references a SHARED base could arrive first and ATLAS-404 — on
+  CCI's run that cascaded through 38 rejections (the models plus the
+  topics / documents that pointed at them). `transform()` now sorts
+  via Kahn's algorithm, so parents land before children for arbitrary
+  chain depths (`shared → extension → workbook`). A cycle — shouldn't
+  happen on real Omni data, but if it does — falls back to input order
+  with a WARN rather than returning a partial list.
+
+### Added
+
+- `tests/test_atlan_catalog.py` — 11 new tests for the resolver (cache,
+  5xx handling, network errors, enabled-flag semantics).
+- `tests/test_transformer.py` — 4 topo-sort tests + 4 source-type
+  resolver integration tests.
+- Activity result dict now includes `source_type_resolver_stats` and
+  `source_type_resolver_enabled` so a Temporal history reader can see
+  how many sources Atlan knew about vs. how many we skipped.
+
 ## [0.4.4] - 2026-10-26
 
 Dependency maintenance from Atlan's 2026-10-26 ask. The new partner base
