@@ -300,6 +300,63 @@ def test_folder_path_and_owner():
     assert f["attributes"]["ownerUsers"] == ["alice@example.com"]
 
 
+# ---------------------------------------------------------------------------
+# 0.4.6 — sourceOwners parallel to ownerUsers so attribution survives when
+# the Omni user isn't in Atlan's user directory (Atlan 2026-10-30).
+# ---------------------------------------------------------------------------
+
+def test_source_owners_emitted_on_folder_alongside_owner_users():
+    """Fold1's owner has both an email (for ownerUsers) and a display name.
+    Both fields must be set."""
+    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
+    assert f["attributes"]["ownerUsers"] == ["alice@example.com"]
+    assert f["attributes"]["sourceOwners"] == "Alice"
+
+
+def test_source_owners_emitted_on_document():
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
+    # Doc1's owner is Bob with email + name.
+    assert d["attributes"]["ownerUsers"] == ["bob@example.com"]
+    assert d["attributes"]["sourceOwners"] == "Bob"
+
+
+def test_source_owners_emitted_on_model_from_owner_name_fallback():
+    """Mod1's /v1/models record has only `ownerName` (no owner object).
+    `sourceOwners` should still land, carrying the display name."""
+    m = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
+    assert m["attributes"]["sourceOwners"] == "Alice Builder"
+
+
+def test_source_owners_prefers_name_over_email():
+    """Unlike ownerUsers which prefers email (for user matching),
+    sourceOwners prefers the display name (for humans to read)."""
+    from app.transformer import OmniMetadataTransformer
+    owner = {"email": "alice@example.com", "name": "Alice Builder"}
+    assert OmniMetadataTransformer._source_owners(owner) == "Alice Builder"
+
+
+def test_source_owners_falls_back_to_email_without_name():
+    """If Omni gave us only an email, it still lands under sourceOwners."""
+    from app.transformer import OmniMetadataTransformer
+    owner = {"email": "alice@example.com"}
+    assert OmniMetadataTransformer._source_owners(owner) == "alice@example.com"
+
+
+def test_source_owners_none_when_owner_has_no_identifying_fields():
+    """Empty / all-None owner dict must not emit the attribute."""
+    from app.transformer import OmniMetadataTransformer
+    assert OmniMetadataTransformer._source_owners({}) is None
+    assert OmniMetadataTransformer._source_owners(None) is None
+    assert OmniMetadataTransformer._source_owners({"name": None, "email": None}) is None
+
+
+def test_source_owners_absent_when_no_owner():
+    """Doc2 has no owner info. `sourceOwners` must not appear in attrs."""
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
+    assert "sourceOwners" not in d["attributes"]
+    assert "ownerUsers" not in d["attributes"]
+
+
 def test_topic_does_not_carry_source_table_attrs():
     """Per typedef ref §5.3: warehouse lineage lives on Process, not on Topic."""
     orders = next(
@@ -848,7 +905,7 @@ def test_models_with_schema_base_treated_as_root():
     assert order == ["shared1"]  # schema1 is filtered, shared1 emits
 
 
-def test_models_topo_sort_cycle_falls_back_without_dropping(caplog):
+def test_models_topo_sort_cycle_falls_back_without_dropping():
     """A cycle in Omni's data (shouldn't happen but could) must not lose
     models — fall back to input order with a WARN rather than return a
     partial list."""

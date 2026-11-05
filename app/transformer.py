@@ -310,6 +310,31 @@ class OmniMetadataTransformer:
         candidate = owner.get("email") or owner.get("username") or owner.get("name")
         return [candidate] if candidate else None
 
+    @staticmethod
+    def _source_owners(owner: dict[str, Any] | None) -> str | None:
+        """Display-name attribution that survives even when Atlan can't match
+        the Omni owner to an Atlan user.
+
+        `ownerUsers` is the typed link: Atlan validates the candidate against
+        its user directory and drops it on a miss. Most Omni owners on real
+        tenants aren't Atlan users (different email, external contractor,
+        Omni service account), so the whole owner disappears.
+
+        `sourceOwners` is a plain string Atlan accepts regardless, so
+        attribution is preserved. We set BOTH: the link lights up when the
+        Omni user IS in Atlan, and `sourceOwners` always carries the name
+        for display in the asset page.
+
+        Prefers display `name` over email/username — this field is for
+        humans to read, unlike `ownerUsers`.
+        """
+        if not owner:
+            return None
+        display = owner.get("name") or owner.get("username") or owner.get("email")
+        if not display:
+            return None
+        return str(display)
+
     # ------------------------------------------------------------------ #
     # Entity builders
     # ------------------------------------------------------------------ #
@@ -348,9 +373,13 @@ class OmniMetadataTransformer:
             # baseModelId, connectionId, createdAt, deletedAt, id, modelKind,
             # name, updatedAt — that is the whole record). The read could only
             # ever yield None. Folders and documents keep theirs.
-            owner_users = self._owner_users(row.get("owner") or {"name": row.get("ownerName")})
+            owner_source = row.get("owner") or {"name": row.get("ownerName")}
+            owner_users = self._owner_users(owner_source)
             if owner_users:
                 attrs["ownerUsers"] = owner_users
+            source_owners = self._source_owners(owner_source)
+            if source_owners:
+                attrs["sourceOwners"] = source_owners
 
             rel_attrs: dict[str, Any] = {}
             base_model_id = row.get("baseModelId")
@@ -466,11 +495,13 @@ class OmniMetadataTransformer:
             scope = self._normalize_enum(row.get("scope"), _SCOPES)
             if scope:
                 attrs["omniV01Scope"] = scope
-            owner_users = self._owner_users(
-                owner if owner else {"name": row.get("ownerName")}
-            )
+            owner_source = owner if owner else {"name": row.get("ownerName")}
+            owner_users = self._owner_users(owner_source)
             if owner_users:
                 attrs["ownerUsers"] = owner_users
+            source_owners = self._source_owners(owner_source)
+            if source_owners:
+                attrs["sourceOwners"] = source_owners
 
             # Empty dict, not omitted: without the key the serializer writes
             # `relationshipAttributes: null` and Atlan's calculate-diff step
@@ -519,11 +550,13 @@ class OmniMetadataTransformer:
             scope = self._normalize_enum(row.get("scope"), _SCOPES)
             if scope:
                 attrs["omniV01Scope"] = scope
-            owner_users = self._owner_users(
-                owner if owner else {"name": row.get("ownerName")}
-            )
+            owner_source = owner if owner else {"name": row.get("ownerName")}
+            owner_users = self._owner_users(owner_source)
             if owner_users:
                 attrs["ownerUsers"] = owner_users
+            source_owners = self._source_owners(owner_source)
+            if source_owners:
+                attrs["sourceOwners"] = source_owners
 
             rel_attrs: dict[str, Any] = {}
             folder_id = folder.get("id")
