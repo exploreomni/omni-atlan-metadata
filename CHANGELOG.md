@@ -4,6 +4,29 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-11-04
+
+### Fixed
+
+- **`sourceOwners` now set alongside `ownerUsers`.** From Atlan's
+  2026-10-30 feedback: `ownerUsers` is the typed link, and Atlan's
+  publisher drops any candidate that doesn't match a real Atlan user —
+  so Omni owners who aren't in Atlan's user directory disappeared from
+  the asset page entirely. `sourceOwners` is a plain-string attribution
+  Atlan accepts regardless, so the display name survives. We now set
+  both on every Model / Folder / Document: `ownerUsers` lights up the
+  typed link when the email matches an Atlan user, `sourceOwners`
+  always carries the display name. Prefers Omni's display `name` over
+  email/username — this field is read by humans, unlike `ownerUsers`.
+
+### Known / not fixed
+
+- `scope = restricted` still drops to no `omniV01Scope`. Atlan flagged
+  this but asked us to wait for customer confirmation before changing
+  — adding `RESTRICTED` to our enum without the Atlan typedef also
+  accepting it would ATLAS-reject the whole document. Picking up once
+  Atlan confirms.
+
 ## [0.4.5] - 2026-10-29
 
 Two publish-blocking fixes from Atlan's 2026-10-29 review of CCI's first
